@@ -5,6 +5,13 @@
 </div>
 <hr />
 <br />
+
+> [!NOTE]
+> This fork adds stable DLSS Neural Rendering for VR games that render the left
+> and right eye on alternating frames. Each eye is processed separately to
+> prevent flickering and unstable colours. It was developed and tested for
+> Witcher3VR.
+
 <div align="center">
   <a href="https://github.com/sponsors/cdozdil?frequency=one-time"><img src="images/gh-sponsor-red.png" /></a>
   <a href="https://buymeacoffee.com/nitec"><img src="images/bmac.png" /></a>

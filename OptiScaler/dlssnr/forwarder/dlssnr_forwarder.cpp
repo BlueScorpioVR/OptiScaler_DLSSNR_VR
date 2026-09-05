@@ -53,6 +53,48 @@ void setResource(void *params, const char *name, ID3D12Resource *v) {
     reinterpret_cast<PFN_SetULL>(vt[VT_SET_ULL])(params, name, (unsigned long long) v);
 }
 
+// Feature 18 consumes more than the two historical DLSSNR.Width/Height aliases. ReShade's working
+// integration supplies the generic NGX dimensions as well as the NR input/output dimensions and
+// explicitly describes a native-resolution invocation. Leaving those keys absent lets the signed
+// feature infer a stale or incomplete scaling contract even though all four resources are valid.
+void setNativeContract(void *params, unsigned int inputWidth, unsigned int inputHeight,
+                       unsigned int outputWidth, unsigned int outputHeight,
+                       unsigned int createFlags, bool isHdr, unsigned int uiCorrection) {
+    if (!params) {
+        return;
+    }
+
+    setUInt(params, "Width", inputWidth);
+    setUInt(params, "Height", inputHeight);
+    setUInt(params, "OutWidth", outputWidth);
+    setUInt(params, "OutHeight", outputHeight);
+
+    setUInt(params, "DLSSNR.Width", inputWidth);
+    setUInt(params, "DLSSNR.Height", inputHeight);
+    setUInt(params, "DLSSNR.InputWidth", inputWidth);
+    setUInt(params, "DLSSNR.InputHeight", inputHeight);
+    setUInt(params, "DLSSNR.OutputWidth", outputWidth);
+    setUInt(params, "DLSSNR.OutputHeight", outputHeight);
+
+    const float scaleX = inputWidth != 0 ? (float) outputWidth / (float) inputWidth : 1.0f;
+    const float scaleY = inputHeight != 0 ? (float) outputHeight / (float) inputHeight : 1.0f;
+    const float scale = scaleX < scaleY ? scaleX : scaleY;
+    setFloat(params, "DLSSNR.ScalingRatio", scale);
+    setFloat(params, "DLSSNR.Scale", scale);
+    setUInt(params, "DLSSNR.Upscaling", inputWidth != outputWidth || inputHeight != outputHeight);
+
+    // ReShade preserves the game's flags and makes the HDR/auto-exposure contract explicit. The
+    // Witcher already supplies 0x4b; ORing the two HDR bits is therefore a no-op there and keeps the
+    // contract correct for a caller whose HDR surface was classified from its format instead.
+    const unsigned int nrCreateFlags = isHdr ? (createFlags | 0x41u) : createFlags;
+    setUInt(params, "DLSS.Feature.Create.Flags", nrCreateFlags);
+    setFloat(params, "DLSS.Pre.Exposure", 1.0f);
+    setFloat(params, "DLSS.Exposure.Scale", 1.0f);
+    setUInt(params, "DLSS.Indicator.Invert.X.Axis", 0u);
+    setUInt(params, "DLSS.Indicator.Invert.Y.Axis", 0u);
+    setUInt(params, "DLSSNR.UICorrection", uiCorrection);
+}
+
 using PFN_NrInitExt = int(__cdecl *)(unsigned long long, const wchar_t *, ID3D12Device *, int,
                                      const void *);
 using PFN_NrCreate = int(__cdecl *)(ID3D12GraphicsCommandList *, int, const void *, void **);
@@ -113,6 +155,19 @@ __declspec(dllexport) void dlssnr_call_probe_float(void *params, const char *nam
 // Last init and create results, so the add-on can log why a feature never appeared.
 __declspec(dllexport) int dlssnr_call_last_init = 0;
 __declspec(dllexport) int dlssnr_call_last_create = 0;
+
+// Required by the V23028 host. Kept separate from create/evaluate so the full contract is rewritten
+// immediately before both calls, just as it is by the working ReShade path.
+__declspec(dllexport) void dlssnr_call_set_contract(void *capabilityParams,
+                                                    unsigned int inputWidth,
+                                                    unsigned int inputHeight,
+                                                    unsigned int outputWidth,
+                                                    unsigned int outputHeight,
+                                                    unsigned int createFlags, int isHdr,
+                                                    unsigned int uiCorrection) {
+    setNativeContract(capabilityParams, inputWidth, inputHeight, outputWidth, outputHeight,
+                      createFlags, isHdr != 0, uiCorrection);
+}
 
 // Creates a persistent Neural Rendering feature. The handle records initialisation work into cmd, so it
 // must outlive that command list's execution; releasing it early loses the device.

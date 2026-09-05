@@ -28,8 +28,13 @@ namespace DlssNr
 // timingQueue is the queue this command list will be executed on, when the caller knows it.
 // State::currentCommandQueue only exists once a D3D12 swapchain has been created, which a Vulkan
 // game never does -- so without this the pass runs and never reports what it cost.
-void EvaluateAfterUpscale(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* params,
+void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList* cmdList,
+                          NVSDK_NGX_Parameter* params,
                           ID3D12CommandQueue* timingQueue = nullptr);
+
+// Retires the model feature and resources associated with one source upscaler handle. The resources
+// are parked rather than destroyed immediately because the GPU can still reference them.
+void ReleaseForHandle(unsigned int sourceHandleId);
 
 
 // Frame generation titles tag their UI layer through Streamline; a copy of it makes the HUD mask
