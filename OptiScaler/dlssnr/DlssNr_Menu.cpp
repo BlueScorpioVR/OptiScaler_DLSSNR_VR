@@ -41,10 +41,11 @@ void RenderMenu(Config* config, float menuResScale)
         if (ImGui::Checkbox("Enable Neural Rendering", &enabled))
             config->DlssNrEnabled = enabled;
 
-        HelpMarker("Synthesises detail in the upscaler's output, before frame generation sees it."
+        ImGui::TextUnformatted("V23040 - Neural Rendering BEFORE super resolution");
+        HelpMarker("Processes the render input; super resolution reconstructs the enhanced result."
                        "\n\nNeeds two similarly named files beside OptiScaler, one character apart:"
                        "\n  nvngx_dlssnr.dll       NVIDIA's model (~165 MB) -- you supply it"
-                       "\n  nvngx.dll_dlssnr.dll   the forwarder (~13 KB) -- ships in this package"
+                       "\n  nvngx.dll_dlssnr.dll   the unchanged V23029 forwarder"
                        "\nUndocumented and driven directly, so none of this is officially supported.");
 
         // The toggle can be bound to a key, and nobody would think to look for it under Keybinds
@@ -74,7 +75,7 @@ void RenderMenu(Config* config, float menuResScale)
             const auto ms = DlssNr::LastGpuTime();
 
             if (ms.has_value())
-                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Running - %.2f ms per frame",
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Running before SR - %.2f ms per evaluation",
                                    ms.value());
             else
                 ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Running.");
@@ -117,15 +118,10 @@ void RenderMenu(Config* config, float menuResScale)
             pendingScale = -1;
         }
 
-        HelpMarker("What fraction of the frame the model works at. Cost falls with the square of"
-                       "\nthis, so half resolution is roughly a quarter of the time."
-                       "\n\nThe frame is never reduced. Only the model's contribution is computed small"
-                       "\nand enlarged, so the picture underneath is untouched whatever this says."
-                       "\n\nWhat it trades: the shading the model adds is broad and survives enlargement;"
-                       "\nthe fine structure it synthesises does not, and softens. Worth having when the"
-                       "\npass costs more than you want to pay for the detail it returns."
-                       "\n\nThe frame itself stays at full detail whatever this says -- only the"
-                       "\nmodel's own work is done small.");
+        HelpMarker("Percentage of the RENDER input dimensions, not the final display resolution."
+                       "\n100% already runs below display resolution when DLSS upscaling is enabled."
+                       "\nLower values further reduce only NR's model input/output; DLSS runs afterward."
+                       "\nUse 100% for the first pre-SR comparison. Lower values may soften detail.");
 
         ImGui::SeparatorText("How much of it lands");
 

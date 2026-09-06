@@ -3,7 +3,7 @@
 #include <d3d12.h>
 #include <nvsdk_ngx.h>
 
-// DLSS 5 Neural Rendering, run over the upscaler's output.
+// V23040: DLSS Neural Rendering on the render input, before super resolution.
 //
 // Neural Rendering is a post-process, not an upscaler and not a denoiser: it takes a finished frame plus
 // depth and motion vectors and synthesises detail. NVIDIA ships no public integration for it, so it is
@@ -17,10 +17,10 @@ class Config;
 
 namespace DlssNr
 {
-// The model runs immediately after the game's upscaler, before the interface is drawn. It is shown a
+// The model runs immediately before the game's upscaler, before the interface is drawn. It is shown a
 // display-referred proxy of that frame -- the sort of picture it was trained on -- and its answer is
 // composed back over the untouched original.
-// Runs the model over Output on the same command list, immediately after the upscaler has written it.
+// Runs the model over Color on the same command list, leaving it readable for super resolution.
 // Called only for upscaler evaluates -- never for frame generation, which is the whole point.
 //
 // Safe to call every frame; it builds what it needs on first use and disables itself for the session if
@@ -28,7 +28,7 @@ namespace DlssNr
 // timingQueue is the queue this command list will be executed on, when the caller knows it.
 // State::currentCommandQueue only exists once a D3D12 swapchain has been created, which a Vulkan
 // game never does -- so without this the pass runs and never reports what it cost.
-void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList* cmdList,
+void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList* cmdList,
                           NVSDK_NGX_Parameter* params,
                           ID3D12CommandQueue* timingQueue = nullptr);
 
@@ -62,7 +62,7 @@ const char* FailureReason();
 // What the pass last cost on the GPU, in milliseconds, or nothing if it has not been measured yet.
 std::optional<double> LastGpuTime();
 
-// Writes a run of consecutive frames, each as the upscaler produced it and again after the model's edit.
+// Writes a run of pre-SR frames, each before and after the model's edit (not the final SR output).
 // The pair is a control: same frames, same run, one variable.
 void RequestCapture(unsigned int frames);
 bool CaptureInProgress();

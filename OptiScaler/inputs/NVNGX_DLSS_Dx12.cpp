@@ -1064,6 +1064,10 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
         UpscalerInputsDx12::UpscaleEnd(InCmdList, InParameters, feature);
 
         ScopedSkipHeapCapture skip {};
+        // Run inside OptiScaler's protected command-list scope, after input tracking and before SR.
+        // Running outside TryEvaluate would let NR overwrite the root signature that gets restored.
+        if (HandleToFeature[handleId] == NVSDK_NGX_Feature_SuperSampling)
+            DlssNr::EvaluateBeforeUpscale(handleId, InCmdList, InParameters);
         evalSuccess = feature->Evaluate(InCmdList, InParameters);
     }
 
@@ -1154,17 +1158,13 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         {
             LOG_DEBUG("Passthrough to native DLSS EvaluateFeature for handle {}", handleId);
 
+            // V23040 replaces the post-SR pass. Do not offer RR or frame generation to NR.
+            if (feature == NVSDK_NGX_Feature_SuperSampling)
+                DlssNr::EvaluateBeforeUpscale(handleId, InCmdList, InParameters);
+
             NVSDK_NGX_Result result =
                 NVNGXProxy::D3D12_EvaluateFeature()(InCmdList, InFeatureHandle, InParameters, InCallback);
             LOG_DEBUG("Native DLSS EvaluateFeature result: 0x{:X}", (uint32_t) result);
-
-            // Neural Rendering runs over what the upscaler just wrote, on the same list, so frame
-            // generation interpolates from enhanced frames and the model still costs one run per
-            // rendered frame. The feature check is the point: frame generation is handed depth and
-            // motion vectors too, and its handle can reach here because the branch above does not
-            // return, so filtering on the parameter block alone would run the model twice a frame.
-            if (result == NVSDK_NGX_Result_Success && feature != NVSDK_NGX_Feature_FrameGeneration)
-                DlssNr::EvaluateAfterUpscale(handleId, InCmdList, InParameters);
 
             return result;
         }
@@ -1188,10 +1188,6 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
 
     // OptiScaler internal handling
     const NVSDK_NGX_Result optiResult = TryEvaluateOptiFeature(InCmdList, InFeatureHandle, InParameters, InCallback);
-
-    // Same pass, for OptiScaler's own upscalers rather than native DLSS.
-    if (optiResult == NVSDK_NGX_Result_Success && feature != NVSDK_NGX_Feature_FrameGeneration)
-        DlssNr::EvaluateAfterUpscale(handleId, InCmdList, InParameters);
 
     return optiResult;
 }

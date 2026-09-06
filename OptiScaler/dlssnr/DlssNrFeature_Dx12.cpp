@@ -3,6 +3,7 @@
 #include <set>
 
 #include "DlssNr.h"
+#include "NrBeforeSrContract.h"
 
 
 #include "DlssNr_Codec.h"
@@ -201,6 +202,9 @@ struct NrPerHandle
     // a string of coloured cells.
     ID3D12Resource* hdrCopy = nullptr;
 
+    // Pre-SR Color is not necessarily UAV-capable. Resolve there and copy back only the active rect.
+    ID3D12Resource* resolveCopy = nullptr;
+
     // The frame shrunk for the model, when it is working below full resolution.
     ID3D12Resource* colorSmall = nullptr;
 
@@ -239,6 +243,7 @@ struct NrPerHandle
 };
 
 NrRuntime g_runtime;
+int g_capabilityFloatSlot = -1;
 std::unordered_map<unsigned int, NrPerHandle> g_nrByHandle;
 std::unique_ptr<DlssNr_Dx12> g_compose;
 
@@ -374,7 +379,8 @@ bool EnsureForwarder()
     g_runtime.lastCreate = (int*) GetProcAddress(g_runtime.forwarder, "dlssnr_call_last_create");
 
     if (g_runtime.create == nullptr || g_runtime.evaluate == nullptr ||
-        g_runtime.setContract == nullptr)
+        g_runtime.setContract == nullptr || g_runtime.probeFloat == nullptr ||
+        g_runtime.setFloatSlot == nullptr)
     {
         g_runtime.reason = "the forwarder is missing its exports";
         return false;
@@ -416,6 +422,11 @@ bool EnsureCapabilityParams(ID3D12Device* device)
 
     // Before anything is written to it, work out where this block keeps floats.
     DiscoverFloatSlot(g_runtime.capabilityParams);
+    if (g_capabilityFloatSlot < 0)
+    {
+        g_runtime.reason = "cannot safely restore the shared SR float parameters";
+        return false;
+    }
     return true;
 }
 
@@ -447,6 +458,7 @@ void DiscoverFloatSlot(NVSDK_NGX_Parameter* params)
         if (params->Get(kProbeKey, &readBack) == NVSDK_NGX_Result_Success && readBack == expected)
         {
             g_runtime.setFloatSlot(slot);
+            g_capabilityFloatSlot = slot;
             LOG_INFO("DLSS-NR float parameters go through vtable slot {}", slot);
             return;
         }
@@ -527,7 +539,7 @@ void ReleaseSurfacesIfFormatChanged(NrPerHandle& nr, DXGI_FORMAT needed)
     ParkNrFeature(nr.feature);
 
     for (ID3D12Resource** r :
-         { &nr.output, &nr.colorCopy, &nr.hdrCopy, &nr.colorSmall })
+         { &nr.output, &nr.colorCopy, &nr.hdrCopy, &nr.colorSmall, &nr.resolveCopy })
         ParkNrResource(*r);
 
     nr.reset = true;
@@ -783,7 +795,7 @@ void ReportSkipOnce(const char* reason)
         LOG_INFO("DLSS-NR did not run: {}", reason);
 }
 
-void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList* cmdList,
+void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList* cmdList,
                           NVSDK_NGX_Parameter* params, ID3D12CommandQueue* timingQueue)
 {
     std::lock_guard<std::mutex> nrLock(g_nrMutex);
@@ -802,7 +814,8 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
         return;
     }
 
-    ID3D12Resource* target = GetResource(params, NVSDK_NGX_Parameter_Output, "DLSSD.Output");
+    ID3D12Resource* target = GetResource(params, NVSDK_NGX_Parameter_Color, "DLSSD.Color");
+    ID3D12Resource* srOutput = GetResource(params, NVSDK_NGX_Parameter_Output, "DLSSD.Output");
     ID3D12Resource* depth = GetResource(params, NVSDK_NGX_Parameter_Depth, "DLSSD.Depth");
     ID3D12Resource* motion = GetResource(params, NVSDK_NGX_Parameter_MotionVectors, "DLSSD.MotionVectors");
 
@@ -810,7 +823,7 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
     // carry none of it -- so it stays quiet and tries again next frame.
     if (target == nullptr || depth == nullptr || motion == nullptr)
     {
-        ReportSkipOnce(target == nullptr    ? "the parameters carried no output texture"
+        ReportSkipOnce(target == nullptr    ? "the parameters carried no pre-SR color texture"
                        : depth == nullptr   ? "the parameters carried no depth"
                                             : "the parameters carried no motion vectors");
         return;
@@ -829,14 +842,12 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
     NrPerHandle& nr = g_nrByHandle[sourceHandleId];
 
     const D3D12_RESOURCE_DESC desc = target->GetDesc();
-    const auto width = (unsigned int) desc.Width;
-    const auto height = desc.Height;
+    const auto allocationWidth = (unsigned int) desc.Width;
+    const auto allocationHeight = desc.Height;
+    const bool targetSupportsUav = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
 
-    // Depth and motion vectors are the upscaler's inputs and so are at render resolution, while colour
-    // and output are at display resolution. The authoritative guide extent is the immutable DLSS render
-    // subrect. Generic Width/Height live in the shared NGX parameter block and the NR forwarder rewrites
-    // them to its native output contract, so reading those first made the second eye inherit 3072x3264
-    // instead of Witcher VR's actual 1536x1632 guide extent.
+    // V23030's authoritative render subrect now determines NR color AND guide extent. The allocation
+    // may be padded to display size. Never infer the model size from that allocation or a partial pair.
     unsigned int guideWidth = 0;
     unsigned int guideHeight = 0;
 
@@ -847,18 +858,50 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
             NVSDK_NGX_Result_Success &&
         guideWidth != 0 && guideHeight != 0;
 
+    RenderExtent generic {};
     if (!hasRenderSubrect)
     {
-        guideWidth = 0;
-        guideHeight = 0;
-        params->Get(NVSDK_NGX_Parameter_Width, &guideWidth);
-        params->Get(NVSDK_NGX_Parameter_Height, &guideHeight);
+        params->Get(NVSDK_NGX_Parameter_Width, &generic.width);
+        params->Get(NVSDK_NGX_Parameter_Height, &generic.height);
     }
 
-    if (guideWidth == 0 || guideHeight == 0)
+    const auto active = BeforeSrExtent({guideWidth, guideHeight}, hasRenderSubrect, generic,
+                                       {allocationWidth, allocationHeight});
+    const auto width = active.width;
+    const auto height = active.height;
+    guideWidth = width;
+    guideHeight = height;
+
+    // This trial handles separate 2D, zero-origin inputs (including padded allocations). Do not
+    // silently read another eye/region for layouts that need a separate offset-aware integration.
+    bool unsupportedOffset = false;
+    for (const char* key : { NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X,
+                            NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y,
+                            NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X,
+                            NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y,
+                            NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X,
+                            NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y })
     {
-        guideWidth = width;
-        guideHeight = height;
+        unsigned int offset = 0;
+        if (params->Get(key, &offset) == NVSDK_NGX_Result_Success && offset != 0)
+            unsupportedOffset = true;
+    }
+    const auto depthDesc = depth->GetDesc();
+    const auto motionDesc = motion->GetDesc();
+    if (unsupportedOffset || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 ||
+        (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0 ||
+        depthDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        motionDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        depthDesc.DepthOrArraySize != 1 || motionDesc.DepthOrArraySize != 1 ||
+        depthDesc.SampleDesc.Count != 1 || motionDesc.SampleDesc.Count != 1 ||
+        !FitsBeforeSr(active, desc.Width, desc.Height) ||
+        !FitsBeforeSr(active, depthDesc.Width, depthDesc.Height) ||
+        !FitsBeforeSr(active, motionDesc.Width, motionDesc.Height))
+    {
+        ReportSkipOnce("V23040 pre-SR requires valid zero-origin, separate 2D color/depth/motion inputs");
+        device->Release();
+        return;
     }
 
     // The game states its depth convention in the flags it created its own feature with, so there is no
@@ -867,7 +910,9 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
     params->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &createFlags);
     const bool gameSaysInverted = (createFlags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
     const bool gameSaysHdr = (createFlags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0;
-    const bool isHdrBuffer = gameSaysHdr && FormatCanHoldLinearHdr(desc.Format);
+    // PR #6 uses the SR output's color-space contract; keep this decision independent of inject point.
+    const bool isHdrBuffer = gameSaysHdr &&
+        FormatCanHoldLinearHdr(srOutput != nullptr ? srOutput->GetDesc().Format : desc.Format);
 
     nr.guideDepthInverted = gameSaysInverted;
 
@@ -882,35 +927,18 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
     if (params->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &mvScaleY) != NVSDK_NGX_Result_Success)
         mvScaleY = 1.0f;
 
-    // Two factors, and both are needed. The game's own scale turns its vectors into render pixels --
-    // Cyberpunk reports 1920 x 1080, so its vectors are normalised. The upscale ratio then carries
-    // render pixels onto a display-resolution image. They coincide only at native resolution, which is
-    // exactly where this was first tested.
-    const float upscaleX = guideWidth != 0 ? (float) width / (float) guideWidth : 1.0f;
-    const float upscaleY = guideHeight != 0 ? (float) height / (float) guideHeight : 1.0f;
-    // The game's own encoding, times the resolution ratio.
-    // The game's own encoding, and nothing else.
-    //
-    // Multiplying by the upscale ratio was reasoning, not measurement, and it was only ever exercised
-    // at native resolution where the ratio is 1 and the mistake is invisible. Every resource already
-    // carries its own subrect -- MVecSubrectWidth and Height say the motion texture is render sized --
-    // so the model is told the size twice and scales for it twice. Vectors come out half again too
-    // long and the model warps its history past where the surface actually went, which smears the
-    // frame along the direction of motion.
+    // V23030's motion encoding is preserved. WorkingScale is applied exactly once at evaluate.
     nr.guideMvScaleX = mvScaleX;
     nr.guideMvScaleY = mvScaleY;
-    (void) upscaleX;
-    (void) upscaleY;
 
     static bool reportedGuides = false;
 
     if (!reportedGuides)
     {
         reportedGuides = true;
-        LOG_INFO("DLSS-NR guides: depth {}, motion vector scale {} x {} (the game says {} x {}, times "
-                 "the {}x{} upscale ratio)",
+        LOG_INFO("V23040 DLSS-NR BEFORE SR: depth {}, game motion vector scale {} x {}",
                  nr.guideDepthInverted ? "inverted" : "not inverted", nr.guideMvScaleX,
-                 nr.guideMvScaleY, mvScaleX, mvScaleY, upscaleX, upscaleY);
+                 nr.guideMvScaleY);
     }
 
     if (cfg.DlssNrProxyProbe.value_or_default())
@@ -924,8 +952,13 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
         return;
     }
 
-    // What the model works at. The frame and its edit stay full resolution; only the model's input and
-    // answer shrink, and the resolve enlarges the answer while compositing.
+    const auto outputDesc = srOutput != nullptr ? srOutput->GetDesc() : desc;
+    SharedContractRestore restoreSrContract(g_runtime.capabilityParams,
+        [](NVSDK_NGX_Parameter* p, const char* key, float value) {
+            g_runtime.probeFloat(p, key, value, g_capabilityFloatSlot);
+        }, active, RenderExtent{(unsigned int) outputDesc.Width, outputDesc.Height});
+
+    // WorkingScale is now relative to the active render extent, not the display extent.
     float workScale = cfg.DlssNrWorkingScale.value_or_default();
     workScale = workScale < 0.25f ? 0.25f : (workScale > 1.0f ? 1.0f : workScale);
     const auto workWidth = (unsigned int) (width * workScale + 0.5f);
@@ -957,6 +990,7 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
             ParkNrResource(nr.colorCopy);
             ParkNrResource(nr.hdrCopy);
             ParkNrResource(nr.colorSmall);
+            ParkNrResource(nr.resolveCopy);
         }
     }
 
@@ -971,6 +1005,19 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
 
     if (reduced && nr.colorSmall == nullptr)
         nr.colorSmall = CreateScratch(device, desc.Format, workWidth, workHeight);
+
+    if (!targetSupportsUav && nr.resolveCopy == nullptr)
+        nr.resolveCopy = CreateScratch(device, desc.Format, width, height);
+
+    if (nr.output == nullptr || nr.colorCopy == nullptr || nr.hdrCopy == nullptr ||
+        (reduced && nr.colorSmall == nullptr) || (!targetSupportsUav && nr.resolveCopy == nullptr))
+    {
+        g_runtime.failed = true;
+        g_runtime.reason = "V23040 pre-SR scratch allocation failed";
+        LOG_ERROR("DLSS-NR unavailable: {}", g_runtime.reason);
+        device->Release();
+        return;
+    }
 
     if (nr.feature == nullptr && nr.output != nullptr && nr.colorCopy != nullptr &&
         nr.hdrCopy != nullptr)
@@ -1025,9 +1072,12 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
         nr.height = height;
         nr.reset = true;
         RecordBuiltTuning(nr, cfg);
-        LOG_INFO("DLSS-NR handle {} running at {}x{}, guides {}x{} (preset {}, intensity {}, style {})",
+        LOG_INFO("V23040 DLSS-NR BEFORE SR handle {} running at {}x{}, guides {}x{} (preset {}, intensity {}, style {})",
                  sourceHandleId, width, height, guideWidth, guideHeight, nr.builtPreset,
                  nr.builtIntensity, nr.builtStyle);
+        LOG_INFO("V23040 pre-SR allocation {}x{}, SR output {}x{}, copy resolve {}, shared NGX params {}",
+                 desc.Width, desc.Height, outputDesc.Width, outputDesc.Height, !targetSupportsUav,
+                 g_runtime.capabilityParams == params);
         LOG_INFO("DLSS-NR contract: input/output {}x{}, native scale 1, upscaling off, create flags "
                  "0x{:X}, HDR {}, pre-exposure 1, exposure scale 1, UI correction off",
                  workWidth, workHeight, createFlags, isHdrBuffer ? "on" : "off");
@@ -1045,7 +1095,7 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
         return;
     }
 
-    // The upscaler has just written this, so it is a UAV. The model needs it readable.
+    // SR's input arrives shader-readable and must leave in that same state.
     // Whether the buffer the upscaler just wrote is linear HDR or an already tone-mapped picture is not
     // something to assume: the game says so, in the flags it created its own DLSS feature with. Running
     // the colour transform over a frame that has already been through a tonemapper is pure damage, and
@@ -1121,13 +1171,9 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
     encodeParams.Width = width;
     encodeParams.Height = height;
 
-    Barrier(cmdList, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     g_compose->Dispatch(cmdList, encodeParams, target, nullptr, nullptr, nullptr, nullptr,
                         nr.colorCopy, nr.hdrCopy);
 
-    Barrier(cmdList, target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // The transitions double as the wait for the encode's writes.
     Barrier(cmdList, nr.colorCopy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1271,20 +1317,50 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
 
         Barrier(cmdList, nr.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        ID3D12Resource* resolveTarget = targetSupportsUav ? target : nr.resolveCopy;
+        if (targetSupportsUav)
+            Barrier(cmdList, target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         g_compose->Dispatch(cmdList, resolveParams, modelInput, nr.output, nr.hdrCopy, motionIn,
-                            nullptr, target, nullptr);
+                            nullptr, resolveTarget, nullptr);
         Barrier(cmdList, nr.output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-        // On-demand capture works in this path too: the staging copy still holds the frame as the
-        // upscaler produced it, and the edited frame is the output itself. The write happens a few
+        if (targetSupportsUav)
+        {
+            Barrier(cmdList, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        else
+        {
+            Barrier(cmdList, nr.resolveCopy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Barrier(cmdList, target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_TEXTURE_COPY_LOCATION src {};
+            src.pResource = nr.resolveCopy;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            D3D12_TEXTURE_COPY_LOCATION dst {};
+            dst.pResource = target;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            const D3D12_BOX rect {0, 0, 0, width, height, 1};
+            cmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, &rect);
+            Barrier(cmdList, target, D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            Barrier(cmdList, nr.resolveCopy, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+
+        // Captures compare the pre-SR proxy with the NR-edited render input, NOT the final SR output.
+        // The edited Color has already been returned to shader-read state. The write happens a few
         // frames later, once the GPU is certainly past these copies -- this path has no fence of its
         // own.
         if (g_capture.isActive())
         {
             g_capture.record(cmdList, device, nr.colorCopy,
                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, target,
-                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
             if (g_capture.readyToWrite() && g_captureWriteAtFrame == 0)
                 g_captureWriteAtFrame = g_frames + 8;
@@ -1372,7 +1448,7 @@ void ReleaseForHandle(unsigned int sourceHandleId)
     NrPerHandle& nr = it->second;
     ParkNrFeature(nr.feature);
 
-    for (ID3D12Resource** r : { &nr.output, &nr.colorCopy, &nr.hdrCopy, &nr.colorSmall,
+    for (ID3D12Resource** r : { &nr.output, &nr.colorCopy, &nr.hdrCopy, &nr.colorSmall, &nr.resolveCopy,
                                 &nr.depthClone, &nr.motionClone })
         ParkNrResource(*r);
 
@@ -1400,7 +1476,7 @@ void Shutdown()
         if (nr.feature != nullptr && g_runtime.release != nullptr)
             g_runtime.release(nr.feature);
 
-        for (ID3D12Resource* r : { nr.output, nr.colorCopy, nr.hdrCopy, nr.colorSmall,
+        for (ID3D12Resource* r : { nr.output, nr.colorCopy, nr.hdrCopy, nr.colorSmall, nr.resolveCopy,
                                    nr.depthClone, nr.motionClone })
         {
             if (r != nullptr)
