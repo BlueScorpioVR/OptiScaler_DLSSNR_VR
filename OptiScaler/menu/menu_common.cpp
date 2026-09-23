@@ -2,6 +2,7 @@
 #include "menu_common.h"
 
 #include <dlssnr/DlssNr.h>
+#include "../ofxr/ofxr_bridge_client.hpp"
 
 #include "input/input_system.h"
 
@@ -6910,6 +6911,102 @@ void MenuCommon::RenderKeybindSettings(RenderMenuContext& ctx)
     }
 }
 
+static void RenderOfxrVrFramegenMenu()
+{
+    if (!ImGui::CollapsingHeader("OFXR VR Framegen")) return;
+    ImGui::PushID("ofxr_external_v2");
+    if (!ofxr_bridge::available())
+    {
+        ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F),
+                           "OFXR layer not loaded");
+        ImGui::PopID();
+        return;
+    }
+
+    const auto status = ofxr_bridge::snapshot();
+    auto settings = status.desired;
+    int engine = settings.enabled == 0
+        ? 0
+        : settings.frame_generation == 1
+            ? 3
+            : settings.backend == 1 ? 2 : 1;
+    bool changed = ImGui::Combo(
+        "Engine", &engine, "Off\0FidelityFX\0NVIDIA\0FSR 3.1\0");
+    if (changed)
+    {
+        settings.enabled = engine == 0 ? 0 : 1;
+        settings.frame_generation = engine == 3 ? 1 : 0;
+        settings.backend = engine == 2 ? 1 : 0;
+        settings.motion_vectors = engine == 3 ? 1 : 0;
+    }
+
+    if (engine == 2)
+    {
+        int uiPreset = settings.preset == 2 ? 0 : settings.preset == 1 ? 1 : 2;
+        if (ImGui::Combo("NVIDIA preset", &uiPreset, "Fast\0Medium\0Slow\0"))
+        {
+            settings.preset = uiPreset == 0 ? 2 : uiPreset == 1 ? 1 : 0;
+            changed = true;
+        }
+        changed |= ImGui::Combo(
+            "NVIDIA input resolution", &settings.scale,
+            "100%\0" "75%\0" "50%\0");
+        bool backward = settings.backward != 0;
+        if (ImGui::Checkbox("NVIDIA backward flow", &backward))
+        {
+            settings.backward = backward ? 1 : 0;
+            changed = true;
+        }
+    }
+
+    if (changed && !ofxr_bridge::request(settings))
+        ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F),
+                           "Setting rejected by the loaded OFXR layer");
+
+    if (engine == 0)
+    {
+        ImGui::TextDisabled("Disabled");
+    }
+    else if (engine == 3 && !ofxr_bridge::supports_fsr())
+    {
+        ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F),
+                           "FSR requires OFXR provider API v2");
+    }
+    else if (engine == 3)
+    {
+        const auto guides = ofxr_bridge::dlss_guide_statistics();
+        if (guides.fsr_used != 0)
+            ImGui::TextColored(ImVec4(0.20F, 0.90F, 0.35F, 1.0F), "FSR active");
+        else if (guides.depth_publications == 0)
+            ImGui::TextColored(ImVec4(0.95F, 0.65F, 0.15F, 1.0F),
+                               "Waiting for DLSS motion/depth guides");
+        else
+            ImGui::TextColored(ImVec4(0.95F, 0.65F, 0.15F, 1.0F),
+                               "FSR waiting for a complete stereo pair");
+    }
+    else if (status.ready != 0)
+    {
+        ImGui::TextColored(ImVec4(0.20F, 0.90F, 0.35F, 1.0F), "Active");
+    }
+    else if (status.pending != 0)
+    {
+        ImGui::TextColored(ImVec4(0.95F, 0.65F, 0.15F, 1.0F), "Applying...");
+    }
+    else
+    {
+        ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F), "Bypass");
+    }
+
+    int overlay = ofxr_bridge::overlay_setting();
+    if (ImGui::Combo("XR FPS counter", &overlay,
+                     "Off\0Upper left\0Upper right\0Lower left\0Lower right\0"))
+        (void) ofxr_bridge::set_overlay_setting(overlay);
+    bool logging = ofxr_bridge::logging_setting();
+    if (ImGui::Checkbox("OFXR logging (next game start)", &logging))
+        (void) ofxr_bridge::set_logging_setting(logging);
+    ImGui::PopID();
+}
+
 void MenuCommon::RenderMainMenuTable(RenderMenuContext& ctx)
 {
     if (ImGui::BeginTable("main", 2, ImGuiTableFlags_SizingStretchSame))
@@ -6933,6 +7030,7 @@ void MenuCommon::RenderMainMenuTable(RenderMenuContext& ctx)
         // Right column: image quality, initialization, advanced options, appearance, overlay and input settings.
         RenderActiveImageSettings(ctx);
         DlssNr::RenderMenu(ctx.config, ctx.menuResScale);
+        RenderOfxrVrFramegenMenu();
         RenderMagnifierSettings(ctx);
         RenderQuirksSettings(ctx);
         RenderAdvancedSettings(ctx);

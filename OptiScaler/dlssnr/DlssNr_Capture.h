@@ -21,6 +21,8 @@
 #include <string>
 #include <vector>
 
+#include <diagnostics/DredMarkers.h>
+
 namespace capture
 {
 // Bounded on purpose: this writes hundreds of megabytes and must not be able to fill a drive. Each run
@@ -237,7 +239,11 @@ class FrameCapture
         const bool needsTransition = state != D3D12_RESOURCE_STATE_COPY_SOURCE;
 
         if (needsTransition)
+        {
+            DredMarkers::BeforeBarrier(cmd, L"capture-source-copy-begin", src, state,
+                                       D3D12_RESOURCE_STATE_COPY_SOURCE);
             cmd->ResourceBarrier(1, &b);
+        }
 
         D3D12_TEXTURE_COPY_LOCATION dst = {};
         dst.pResource = shot.readback;
@@ -255,6 +261,8 @@ class FrameCapture
         {
             b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
             b.Transition.StateAfter = state;
+            DredMarkers::BeforeBarrier(cmd, L"capture-source-copy-end", src,
+                                       D3D12_RESOURCE_STATE_COPY_SOURCE, state);
             cmd->ResourceBarrier(1, &b);
         }
     }

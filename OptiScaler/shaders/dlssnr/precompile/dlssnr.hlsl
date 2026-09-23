@@ -79,7 +79,10 @@ float3 HueOkLab(float3 incorrect, float3 correct)
     const float3 correctLab = ToOkLab(correct);
     const float incorrectChroma = length(incorrectLab.yz);
     const float correctChroma = length(correctLab.yz);
-    incorrectLab.yz = correctLab.yz * (correctChroma == 0.0 ? 1.0 : incorrectChroma / correctChroma);
+    const float2 hueDirection = correctChroma > 1e-5
+                                    ? correctLab.yz / correctChroma
+                                    : float2(0.0, 0.0);
+    incorrectLab.yz = hueDirection * incorrectChroma;
     return ClampAp1(FromOkLab(incorrectLab));
 }
 
@@ -302,7 +305,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             ratio = (modelLuma + max(0.0, originalLuma - proxyLuma)) / modelLuma;
         }
 
-        upgraded = lerp(original, HueOkLab(model * ratio, model), gTransferStrength);
+        upgraded = lerp(original, HueOkLab(model * ratio, model), saturate(gTransferStrength));
     }
 
     // Detail strength decides how much of the model's picture is reached at all; colour strength
@@ -322,8 +325,14 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // larger than the floor the term vanishes -- while making the ratio fall smoothly to one as
     // luminance approaches zero. No edit at all is the right answer for a pixel with no light in it.
     const float kRatioFloor = 1.0 / 512.0;
-    float lumaRatio = clamp((upgradedLuma + kRatioFloor) / (originalLuma + kRatioFloor), 0.0, gMaxRatio);
-    float3 result = lerp(original * lumaRatio, upgraded, gColourStrength);
+    float lumaRatio = (upgradedLuma + kRatioFloor) / (originalLuma + kRatioFloor);
+    const float guard = max(gMaxRatio, 1.0);
+    const float boundedRatio = clamp(lumaRatio, 1.0 / guard, guard);
+
+    // Bind the complete model-colour endpoint as well as the luminance-only endpoint. The old
+    // one-sided clamp did nothing at the default ColourStrength=1 and did not constrain darkening.
+    upgraded *= boundedRatio / max(lumaRatio, 1e-6);
+    float3 result = lerp(original * boundedRatio, upgraded, saturate(gColourStrength));
 
     // Back out of the normalised space the composition worked in.
     result *= normScale;

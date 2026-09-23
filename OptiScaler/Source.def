@@ -1,4 +1,8 @@
 EXPORTS
+xrNegotiateLoaderApiLayerInterface
+OFXR_OptiScalerProviderV1
+OFXR_OptiScalerProviderV2
+OFXR_SetEmbeddedLayerActiveV1
 GetBehaviorValue = _GetBehaviorValue @100 PRIVATE
 D3D12CreateDevice = _D3D12CreateDeviceExport @101 PRIVATE
 D3D12GetDebugInterface = _D3D12GetDebugInterfaceExport @102 PRIVATE

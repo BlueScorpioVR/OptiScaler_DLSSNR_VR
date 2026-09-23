@@ -754,6 +754,10 @@ void Util::GetDeviceRemovedReason(ID3D12Device* pDevice)
     default:
         LOG_ERROR("Device removed reason: Unknown ({:X})", (UINT) reason);
     }
+
+    // V23074: DRED collection belongs exclusively to the asynchronous device observer.
+    // Keep this helper as an HRESULT explanation for its existing API error callers.
+
 }
 
 void Util::LoadProxyLibrary(const std::wstring& name, const std::wstring& optiPath, const std::wstring& overridePath,

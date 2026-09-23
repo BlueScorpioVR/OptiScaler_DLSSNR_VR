@@ -254,9 +254,11 @@ class Config
     CustomOptional<bool> CreateHeaps { true };
 
     // --- DLSS 5 Neural Rendering (OptiScaler/dlssnr) --- removable as one block -----------------
-    // DLSS Neural Rendering: a detail-synthesis pass over the upscaler's output. Off by default -- it is
-    // an undocumented feature driven directly through its snippet, not something NVIDIA exposes.
+    // DLSS Neural Rendering: a detail-synthesis pass selectable before or after the upscaler. Off by
+    // default -- it is an undocumented feature driven directly through its snippet.
     CustomOptional<bool> DlssNrEnabled { false };
+    // true edits Color before SR; false edits the completed SR Output.
+    CustomOptional<bool> DlssNrRunBeforeSr { true };
     // Toggles the pass in game. Unbound by default -- a key that does something unexpected is worse
     // than one that does nothing.
     CustomOptional<int> DlssNrToggleKey { UnboundKey };

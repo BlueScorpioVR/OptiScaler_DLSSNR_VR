@@ -19,12 +19,16 @@
 #include <imgui/ImGuiNotify.hpp>
 
 #include <hooks/D3D12_Hooks.h>
+#include <diagnostics/DredMarkers.h>
 
 #include <dxgi1_4.h>
+#include <atomic>
+#include <cmath>
 #include <shared_mutex>
 #include "detours/detours.h"
 #include <ankerl/unordered_dense.h>
 #include <misc/IdentifyGpu.h>
+#include "../ofxr/ofxr_bridge_client.hpp"
 
 static ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx12>> Dx12Contexts;
 static std::unordered_map<unsigned int, NVSDK_NGX_Feature> HandleToFeature;
@@ -34,6 +38,238 @@ static int evalCounter = 0;
 static bool shutdown = false;
 static bool _skipInit = false;
 static wchar_t const** paths;
+
+static const char* OfxrGuideStatusName(std::uint32_t status)
+{
+    switch (status)
+    {
+    case 0: return "disabled";
+    case 1: return "waiting_for_dlss";
+    case 2: return "output_not_direct";
+    case 3: return "queue_mismatch";
+    case 4: return "invalid_input";
+    case 5: return "temporal_mismatch";
+    case 6: return "used";
+    default: return "unknown";
+    }
+}
+
+static void MaybeLogOfxrGuideStatistics()
+{
+    const auto s = ofxr_bridge::dlss_guide_statistics();
+    if (s.published == 0) return;
+    static std::atomic_uint64_t lastLoggedPublication { 0 };
+    std::uint64_t previous = lastLoggedPublication.load(std::memory_order_relaxed);
+    if (s.published < previous + 240 ||
+        !lastLoggedPublication.compare_exchange_strong(
+            previous, s.published, std::memory_order_relaxed))
+        return;
+    LOG_INFO(
+        "OFXR DLSS guides: status={} published={} depth={} snapshots={} failures={} "
+        "matched={} used={} fsr_attempts={} fsr_used={} fsr_failures={} fsr_status={}",
+        OfxrGuideStatusName(s.status), s.published, s.depth_publications,
+        s.snapshot_copies, s.snapshot_failures, s.matched, s.used,
+        s.fsr_attempts, s.fsr_used, s.fsr_failures, s.fsr_status);
+}
+
+static NVSDK_NGX_Feature ResolveEvaluatedFeature(
+    unsigned int handleId, NVSDK_NGX_Parameter* parameters)
+{
+    if (const auto known = HandleToFeature.find(handleId);
+        known != HandleToFeature.end())
+        return known->second;
+
+    int interpolationCount = 0;
+    if (parameters->Get("DLSSG.MultiFrameCount", &interpolationCount) ==
+        NVSDK_NGX_Result_Success)
+    {
+        HandleToFeature.emplace(handleId, NVSDK_NGX_Feature_FrameGeneration);
+        LOG_INFO("Late-attached native NGX handle {} classified as FrameGeneration", handleId);
+        return NVSDK_NGX_Feature_FrameGeneration;
+    }
+
+    ID3D12Resource* rayReconstructionGuide = nullptr;
+    if ((parameters->Get(NVSDK_NGX_Parameter_GBuffer_DiffuseAlbedo,
+                         &rayReconstructionGuide) == NVSDK_NGX_Result_Success ||
+         parameters->Get(NVSDK_NGX_Parameter_GBuffer_Albedo,
+                         &rayReconstructionGuide) == NVSDK_NGX_Result_Success) &&
+        rayReconstructionGuide != nullptr)
+    {
+        HandleToFeature.emplace(handleId, NVSDK_NGX_Feature_RayReconstruction);
+        LOG_INFO("Late-attached native NGX handle {} classified as RayReconstruction", handleId);
+        return NVSDK_NGX_Feature_RayReconstruction;
+    }
+
+    ID3D12Resource* output = nullptr;
+    ID3D12Resource* motion = nullptr;
+    if (parameters->Get(NVSDK_NGX_Parameter_Output, &output) ==
+            NVSDK_NGX_Result_Success &&
+        parameters->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) ==
+            NVSDK_NGX_Result_Success &&
+        output != nullptr && motion != nullptr)
+    {
+        HandleToFeature.emplace(handleId, NVSDK_NGX_Feature_SuperSampling);
+        LOG_INFO("Late-attached native NGX handle {} classified as SuperSampling", handleId);
+        return NVSDK_NGX_Feature_SuperSampling;
+    }
+    return NVSDK_NGX_Feature_Reserved0;
+}
+
+static void PublishOfxrDlssGuides(
+    NVSDK_NGX_Result evaluationResult,
+    NVSDK_NGX_Feature evaluatedFeature,
+    unsigned int handleId,
+    ID3D12GraphicsCommandList* commandList,
+    NVSDK_NGX_Parameter* parameters,
+    IFeature_Dx12* optiFeature)
+{
+    const auto control = ofxr_bridge::snapshot();
+    const bool enabled = control.desired.motion_vectors == 1 ||
+        control.desired.frame_generation == 1;
+    ofxr_bridge::configure_dlss_guides(enabled);
+    if (!enabled || evaluationResult != NVSDK_NGX_Result_Success ||
+        evaluatedFeature != NVSDK_NGX_Feature_SuperSampling)
+        return;
+
+    ID3D12Resource* output = nullptr;
+    ID3D12Resource* motion = nullptr;
+    ID3D12Resource* depth = nullptr;
+    auto* queue = State::Instance().currentCommandQueue;
+    if (parameters->Get(NVSDK_NGX_Parameter_Output, &output) !=
+            NVSDK_NGX_Result_Success ||
+        parameters->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) !=
+            NVSDK_NGX_Result_Success ||
+        output == nullptr || motion == nullptr || queue == nullptr)
+        return;
+
+    const auto outputDesc = output->GetDesc();
+    const auto motionDesc = motion->GetDesc();
+    unsigned int outputX = 0;
+    unsigned int outputY = 0;
+    unsigned int depthX = 0;
+    unsigned int depthY = 0;
+    unsigned int displayWidth = optiFeature ? optiFeature->DisplayWidth() : 0;
+    unsigned int displayHeight = optiFeature ? optiFeature->DisplayHeight() : 0;
+    unsigned int renderWidth = optiFeature ? optiFeature->RenderWidth() : 0;
+    unsigned int renderHeight = optiFeature ? optiFeature->RenderHeight() : 0;
+    float motionX = 0.0f;
+    float motionY = 0.0f;
+    float scaleX = 1.0f;
+    float scaleY = 1.0f;
+    float jitterX = 0.0f;
+    float jitterY = 0.0f;
+    float frameTimeDelta = 16.6667f;
+    int reset = 0;
+    unsigned int flags = 0;
+
+    parameters->Get(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X, &outputX);
+    parameters->Get(NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y, &outputY);
+    parameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &depthX);
+    parameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, &depthY);
+    if (displayWidth == 0) parameters->Get(NVSDK_NGX_Parameter_OutWidth, &displayWidth);
+    if (displayHeight == 0) parameters->Get(NVSDK_NGX_Parameter_OutHeight, &displayHeight);
+    parameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &renderWidth);
+    parameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &renderHeight);
+    if (renderWidth == 0) parameters->Get(NVSDK_NGX_Parameter_Width, &renderWidth);
+    if (renderHeight == 0) parameters->Get(NVSDK_NGX_Parameter_Height, &renderHeight);
+    parameters->Get(NVSDK_NGX_Parameter_MV_Offset_X, &motionX);
+    parameters->Get(NVSDK_NGX_Parameter_MV_Offset_Y, &motionY);
+    parameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &scaleX);
+    parameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &scaleY);
+    parameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &jitterX);
+    parameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &jitterY);
+    parameters->Get(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, &frameTimeDelta);
+    parameters->Get(NVSDK_NGX_Parameter_Reset, &reset);
+    parameters->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &flags);
+    parameters->Get(NVSDK_NGX_Parameter_Depth, &depth);
+
+    const unsigned int availableOutputWidth = static_cast<unsigned int>(
+        outputDesc.Width - std::min<UINT64>(outputX, outputDesc.Width));
+    const unsigned int availableOutputHeight = outputDesc.Height -
+        std::min<unsigned int>(outputY, outputDesc.Height);
+    if (displayWidth == 0) displayWidth = availableOutputWidth;
+    if (displayHeight == 0) displayHeight = availableOutputHeight;
+    if (renderWidth == 0) renderWidth = static_cast<unsigned int>(motionDesc.Width);
+    if (renderHeight == 0) renderHeight = motionDesc.Height;
+
+    const bool lowResolutionMotion = optiFeature
+        ? optiFeature->LowResMV()
+        : (flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0;
+    const unsigned int motionWidth = lowResolutionMotion ? renderWidth : displayWidth;
+    const unsigned int motionHeight = lowResolutionMotion ? renderHeight : displayHeight;
+    const unsigned int motionBaseX =
+        static_cast<unsigned int>(std::max(0.0f, motionX));
+    const unsigned int motionBaseY =
+        static_cast<unsigned int>(std::max(0.0f, motionY));
+    const auto motionState = Config::Instance()->MVResourceBarrier.has_value()
+        ? static_cast<D3D12_RESOURCE_STATES>(Config::Instance()->MVResourceBarrier.value())
+        : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const auto depthState = Config::Instance()->DepthResourceBarrier.has_value()
+        ? static_cast<D3D12_RESOURCE_STATES>(Config::Instance()->DepthResourceBarrier.value())
+        : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+    unsigned int depthWidth = 0;
+    unsigned int depthHeight = 0;
+    if (depth != nullptr)
+    {
+        const auto depthDesc = depth->GetDesc();
+        depthWidth = std::min<unsigned int>(renderWidth, static_cast<unsigned int>(
+            depthDesc.Width - std::min<UINT64>(depthX, depthDesc.Width)));
+        depthHeight = std::min<unsigned int>(renderHeight,
+            depthDesc.Height - std::min<unsigned int>(depthY, depthDesc.Height));
+    }
+    if (!std::isfinite(frameTimeDelta) || frameTimeDelta <= 0.0f)
+        frameTimeDelta = 16.6667f;
+    const float cameraNear = Config::Instance()->FsrCameraNear.value_or_default();
+    const float configuredCameraFar = Config::Instance()->FsrCameraFar.value_or_default();
+    const bool depthInfinite = configuredCameraFar == 0.0f;
+    const float cameraFar = depthInfinite
+        ? std::max(cameraNear + 1.0f, 1.0f)
+        : configuredCameraFar;
+    const bool depthInverted = optiFeature
+        ? optiFeature->DepthInverted()
+        : (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
+
+    OFXR_DlssGuidePublicationV2 publication{};
+    publication.stream = handleId;
+    publication.output = output;
+    publication.motion_vectors = motion;
+    publication.producer_queue = queue;
+    publication.producer_command_list = commandList;
+    publication.output_x = outputX;
+    publication.output_y = outputY;
+    publication.output_width = std::min(displayWidth, availableOutputWidth);
+    publication.output_height = std::min(displayHeight, availableOutputHeight);
+    publication.motion_x = motionBaseX;
+    publication.motion_y = motionBaseY;
+    publication.motion_width = std::min<unsigned int>(motionWidth,
+        static_cast<unsigned int>(motionDesc.Width -
+            std::min<UINT64>(motionBaseX, motionDesc.Width)));
+    publication.motion_height = std::min<unsigned int>(motionHeight,
+        motionDesc.Height - std::min<unsigned int>(motionBaseY, motionDesc.Height));
+    publication.scale_x = scaleX;
+    publication.scale_y = scaleY;
+    publication.jitter_x = jitterX;
+    publication.jitter_y = jitterY;
+    publication.resource_state = static_cast<std::uint32_t>(motionState);
+    publication.jittered = optiFeature
+        ? (optiFeature->JitteredMV() ? 1 : 0)
+        : ((flags & NVSDK_NGX_DLSS_Feature_Flags_MVJittered) != 0 ? 1 : 0);
+    publication.reset = reset != 0 ? 1 : 0;
+    publication.depth = depth;
+    publication.depth_x = depthX;
+    publication.depth_y = depthY;
+    publication.depth_width = depthWidth;
+    publication.depth_height = depthHeight;
+    publication.depth_resource_state = static_cast<std::uint32_t>(depthState);
+    publication.frame_time_delta_ms = frameTimeDelta;
+    publication.camera_near = cameraNear;
+    publication.camera_far = cameraFar;
+    publication.depth_inverted = depthInverted ? 1 : 0;
+    publication.depth_infinite = depthInfinite ? 1 : 0;
+    (void)ofxr_bridge::publish_dlss_guides(publication);
+    MaybeLogOfxrGuideStatistics();
+}
 
 class ScopedInitDx12
 {
@@ -818,6 +1054,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_ReleaseFeature(NVSDK_NGX_Handle* 
         return NVSDK_NGX_Result_Success;
 
     auto handleId = InHandle->Id;
+    ofxr_bridge::retire_dlss_guide_stream(handleId);
 
     // Neural Rendering owns one temporal feature per source handle. Retire that history with the
     // upscaler context instead of leaving it available for a later handle that happens to reuse the
@@ -1066,10 +1303,23 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
         ScopedSkipHeapCapture skip {};
         // Run inside OptiScaler's protected command-list scope, after input tracking and before SR.
         // Running outside TryEvaluate would let NR overwrite the root signature that gets restored.
-        if (HandleToFeature[handleId] == NVSDK_NGX_Feature_SuperSampling)
+        if (HandleToFeature[handleId] == NVSDK_NGX_Feature_SuperSampling &&
+            Config::Instance()->DlssNrRunBeforeSr.value_or_default())
             DlssNr::EvaluateBeforeUpscale(handleId, InCmdList, InParameters);
+        static constexpr wchar_t kSrBegin[] = L"OptiScaler V23080 DLSS SR begin";
+        static constexpr wchar_t kSrComplete[] = L"OptiScaler V23080 DLSS SR complete";
+        DredMarkers::Set(InCmdList, kSrBegin);
         evalSuccess = feature->Evaluate(InCmdList, InParameters);
+        NrFlightTrace::Result(InCmdList, L"OptiScaler V23080 DLSS SR result", evalSuccess ? 1 : 0);
+        DredMarkers::Set(InCmdList, kSrComplete);
+        if (evalSuccess && HandleToFeature[handleId] == NVSDK_NGX_Feature_SuperSampling &&
+            !Config::Instance()->DlssNrRunBeforeSr.value_or_default())
+            DlssNr::EvaluateAfterUpscale(handleId, InCmdList, InParameters);
     }
+
+    PublishOfxrDlssGuides(
+        evalSuccess ? NVSDK_NGX_Result_Success : NVSDK_NGX_Result_Fail,
+        HandleToFeature[handleId], handleId, InCmdList, InParameters, feature);
 
     if (!evalSuccess)
     {
@@ -1113,7 +1363,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
     const State& state = State::Instance();
     const Config& cfg = *Config::Instance();
 
-    auto feature = HandleToFeature[handleId];
+    const auto feature = ResolveEvaluatedFeature(handleId, InParameters);
     static size_t evalWithoutFG = 0;
     bool fgCreated = std::any_of(HandleToFeature.begin(), HandleToFeature.end(),
                                  [](const auto& pair) { return pair.second == NVSDK_NGX_Feature_FrameGeneration; });
@@ -1158,13 +1408,26 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         {
             LOG_DEBUG("Passthrough to native DLSS EvaluateFeature for handle {}", handleId);
 
-            // V23040 replaces the post-SR pass. Do not offer RR or frame generation to NR.
-            if (feature == NVSDK_NGX_Feature_SuperSampling)
+            // Offer NR only to ordinary DLSS SR; RR and frame generation remain outside this trial.
+            if (feature == NVSDK_NGX_Feature_SuperSampling &&
+                cfg.DlssNrRunBeforeSr.value_or_default())
                 DlssNr::EvaluateBeforeUpscale(handleId, InCmdList, InParameters);
 
+            static constexpr wchar_t kNativeSrBegin[] = L"OptiScaler V23080 native DLSS SR begin";
+            static constexpr wchar_t kNativeSrComplete[] = L"OptiScaler V23080 native DLSS SR complete";
+            DredMarkers::Set(InCmdList, kNativeSrBegin);
             NVSDK_NGX_Result result =
                 NVNGXProxy::D3D12_EvaluateFeature()(InCmdList, InFeatureHandle, InParameters, InCallback);
+            NrFlightTrace::Result(InCmdList, L"OptiScaler V23080 native DLSS SR result", result);
+            DredMarkers::Set(InCmdList, kNativeSrComplete);
             LOG_DEBUG("Native DLSS EvaluateFeature result: 0x{:X}", (uint32_t) result);
+
+            if (result == NVSDK_NGX_Result_Success && feature == NVSDK_NGX_Feature_SuperSampling &&
+                !cfg.DlssNrRunBeforeSr.value_or_default())
+                DlssNr::EvaluateAfterUpscale(handleId, InCmdList, InParameters);
+
+            PublishOfxrDlssGuides(
+                result, feature, handleId, InCmdList, InParameters, nullptr);
 
             return result;
         }

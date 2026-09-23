@@ -2,6 +2,7 @@
 #include "wrapped_swapchain.h"
 
 #include <Util.h>
+#include <diagnostics/DeviceRemovalDred.h>
 #include <Config.h>
 
 #include <nvapi/fakenvapi.h>
@@ -423,6 +424,19 @@ WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain* real, IUnknown* p
     : _real(real), _device(pDevice), _handle(hWnd), _refcount(1), _uwp(isUWP)
 {
     _id = ++scCount;
+
+    try
+    {
+        _dredMonitor = DeviceRemovalDred::Monitor::Observe(pDevice, Util::DllPath().parent_path());
+        if (_dredMonitor)
+            LOG_WARN("V23080 independent device-removal DRED armed: {}", _dredMonitor->Path().string());
+        else
+            LOG_WARN("V23080 device-removal observer unavailable (non-DX12 owner or setup failure)");
+    }
+    catch (...)
+    {
+        LOG_ERROR("V23080 device-removal observer setup exception");
+    }
     _lastFlags = flags;
 
     _real->QueryInterface(IID_PPV_ARGS(&_real1));

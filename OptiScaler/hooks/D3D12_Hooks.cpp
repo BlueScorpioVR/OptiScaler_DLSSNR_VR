@@ -63,6 +63,31 @@ static bool _creatingD3D12Device = false;
 static bool _d3d12Captured = false;
 static LUID _lastAdapterLuid = {};
 
+// V23070 retains V23069 diagnostics: DRED must be enabled before device creation. Auto-breadcrumbs,
+// breadcrumb contexts and page-fault data are substantially lighter than GPU validation and do not
+// alter command ordering.
+static void EnableDredDiagnosticsOnce()
+{
+    static std::once_flag once;
+    std::call_once(once, []
+    {
+        ID3D12DeviceRemovedExtendedDataSettings1* settings = nullptr;
+        const HRESULT result = D3D12GetDebugInterface(IID_PPV_ARGS(&settings));
+        if (SUCCEEDED(result) && settings != nullptr)
+        {
+            settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            settings->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            settings->Release();
+            LOG_WARN("V23080 DRED auto-breadcrumbs, contexts and page-fault reporting enabled");
+        }
+        else
+        {
+            LOG_WARN("V23080 could not enable DRED diagnostics: 0x{:X}", (uint32_t) result);
+        }
+    });
+}
+
 // Common
 using PFN_SetDescriptorHeaps = rewrite_signature<decltype(&ID3D12GraphicsCommandList::SetDescriptorHeaps)>::type;
 using PFN_SetPipelineState = rewrite_signature<decltype(&ID3D12GraphicsCommandList::SetPipelineState)>::type;
@@ -1334,6 +1359,8 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
     LOG_DEBUG("Adapter: {:X}, Level: {:X}, Caller: {}", (size_t) pAdapter, (UINT) MinimumFeatureLevel,
               Util::WhoIsTheCaller(_ReturnAddress()));
 
+    EnableDredDiagnosticsOnce();
+
 #ifdef ENABLE_DEBUG_LAYER_DX12
     LOG_WARN("Debug layers active!");
     if (debugController == nullptr && D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)) == S_OK)
@@ -1488,6 +1515,8 @@ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter,
 {
     LOG_DEBUG("Adapter: {:X}, Level: {:X}, Caller: {}", (size_t) pAdapter, (UINT) MinimumFeatureLevel,
               Util::WhoIsTheCaller(_ReturnAddress()));
+
+    EnableDredDiagnosticsOnce();
 
     if (_creatingD3D12Device)
     {

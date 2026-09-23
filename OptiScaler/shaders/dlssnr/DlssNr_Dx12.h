@@ -23,26 +23,22 @@
 #include <d3dx/d3dx12.h>
 #include <shaders/Shader_Dx12.h>
 #include <shaders/Shader_Dx12Utils.h>
-
-// Three dispatches are recorded per frame and several frames can be in flight at once, more so with
-// frame generation. Each dispatch needs descriptors and constants the GPU is not still reading, so
-// there has to be enough for three passes times the deepest pipeline we might sit behind.
-#define DLSSNR_NUM_OF_HEAPS 16
+#include <memory>
+#include <mutex>
+#include <vector>
 
 class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
 {
   private:
-    FrameDescriptorHeap _frameHeaps[DLSSNR_NUM_OF_HEAPS];
+    struct DispatchBinding;
 
-    // One constant buffer per heap, not one for the class.
-    //
-    // The shared buffer in the base class suits a shader that dispatches once a frame. Three
-    // dispatches recorded onto one command list all map and overwrite the same upload buffer before
-    // any of them executes, so every pass ends up reading whichever constants were written last --
-    // encode and downsample would run with the resolve's parameters.
-    ID3D12Resource* _constantBuffers[DLSSNR_NUM_OF_HEAPS] = {};
-
-    uint32_t _heapIndex = 0;
+    // A descriptor heap and its constants are immutable after creation. Fixed rotating heaps are
+    // not safe here: OptiScaler records into command lists owned and submitted by the game, so it
+    // cannot know when a slot has retired. OFXR can deepen that queue beyond any guessed ring size.
+    // Identical dispatches share one read-only binding; a changed resource or constant set creates
+    // another binding which remains alive for this shader's lifetime.
+    std::vector<std::unique_ptr<DispatchBinding>> _bindings;
+    std::mutex _bindingsMutex;
 
     // The shader reads five inputs and writes two, and not every mode uses all of them. Unused slots
     // still need a view bound -- an unbound descriptor is not an empty read, it is a read from
@@ -63,4 +59,5 @@ class DlssNr_Dx12 : public Shader_Dx12, public DlssNr_Common
                   ID3D12Resource* InSource, ID3D12Resource* InModel, ID3D12Resource* InOriginal,
                   ID3D12Resource* InMotion, ID3D12Resource* InPrevEdit, ID3D12Resource* OutTarget,
                   ID3D12Resource* OutKeep);
+
 };

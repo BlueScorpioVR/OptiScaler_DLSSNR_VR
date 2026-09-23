@@ -305,6 +305,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     </PreBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="ofxr\provider_api.hpp" />
+    <ClInclude Include="ofxr\ofxr_bridge_client.hpp" />
     <ClInclude Include="dlssnr\NrBeforeSrContract.h" />
     <ClInclude Include="framegen\nvngx\Nvngx_Combo.h" />
     <ClInclude Include="fsr4\FSR4Upgrade.h" />
@@ -602,6 +604,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="NVNGX_Parameter.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="ofxr\ofxr_bridge_client.cpp" />
     <ClCompile Include="framegen\nvngx\Nvngx_Combo.cpp" />
     <ClCompile Include="fsr4\FSR4Upgrade.cpp" />
     <ClCompile Include="gpu_time\GpuTime_Dx11.cpp" />
@@ -856,6 +859,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <None Include="shaders\magnifier\precompile\Magnifier_Shader_Vk.spv" />
     <None Include="Source.def" />
   </ItemGroup>
+  <Import Project="ofxr_embedded.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

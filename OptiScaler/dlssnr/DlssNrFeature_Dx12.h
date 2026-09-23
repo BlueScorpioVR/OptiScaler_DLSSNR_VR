@@ -3,7 +3,7 @@
 #include <d3d12.h>
 #include <nvsdk_ngx.h>
 
-// V23040: DLSS Neural Rendering on the render input, before super resolution.
+// V23070: queue-depth-safe DLSS Neural Rendering route, selectable before or after super resolution.
 //
 // Neural Rendering is a post-process, not an upscaler and not a denoiser: it takes a finished frame plus
 // depth and motion vectors and synthesises detail. NVIDIA ships no public integration for it, so it is
@@ -29,6 +29,11 @@ namespace DlssNr
 // State::currentCommandQueue only exists once a D3D12 swapchain has been created, which a Vulkan
 // game never does -- so without this the pass runs and never reports what it cost.
 void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList* cmdList,
+                          NVSDK_NGX_Parameter* params,
+                          ID3D12CommandQueue* timingQueue = nullptr);
+
+// Runs the same single NR model after SR, over the completed Output texture.
+void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList* cmdList,
                           NVSDK_NGX_Parameter* params,
                           ID3D12CommandQueue* timingQueue = nullptr);
 

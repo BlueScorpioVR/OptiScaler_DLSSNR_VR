@@ -2094,11 +2094,15 @@ bool IFeature_VkwDx12::Evaluate(VkCommandBuffer InCmdBuffer, NVSDK_NGX_Parameter
         if (!Config::Instance()->DisableReactiveMask.value_or(false) && vkReactive.Dx12Resource != nullptr)
             InParameters->Set(NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, (void*) vkReactive.Dx12Resource);
 
-        // V23040 edits the copied D3D12 Color before this bridge invokes its SR backend.
-        if (dx12Feature->GetUpscalerType() != Upscaler::DLSSD)
+        // V23070 can edit either the copied Color before SR or Output after SR.
+        if (dx12Feature->GetUpscalerType() != Upscaler::DLSSD &&
+            Config::Instance()->DlssNrRunBeforeSr.value_or_default())
             DlssNr::EvaluateBeforeUpscale(Handle()->Id, cmdList, InParameters, Dx12CommandQueue);
         LOG_DEBUG("Dispatch!!");
         dx12EvalResult = dx12Feature->Evaluate(cmdList, InParameters);
+        if (dx12EvalResult && dx12Feature->GetUpscalerType() != Upscaler::DLSSD &&
+            !Config::Instance()->DlssNrRunBeforeSr.value_or_default())
+            DlssNr::EvaluateAfterUpscale(Handle()->Id, cmdList, InParameters, Dx12CommandQueue);
 
     } while (false);
 

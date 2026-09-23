@@ -6,6 +6,9 @@
 
 #include "dxgi1_6.h"
 #include "d3d12.h"
+#include <memory>
+
+namespace DeviceRemovalDred { class Monitor; }
 
 #define USE_LOCAL_MUTEX
 
@@ -78,6 +81,7 @@ class DECLSPEC_UUID("3af622a3-82d0-49cd-994f-cce05122c222") WrappedIDXGISwapChai
     HRESULT STDMETHODCALLTYPE SetHDRMetaData(DXGI_HDR_METADATA_TYPE Type, UINT Size, void* pMetaData) override;
 
   private:
+    std::shared_ptr<DeviceRemovalDred::Monitor> _dredMonitor;
     IDXGISwapChain* _real = nullptr;
     IDXGISwapChain1* _real1 = nullptr;
     IDXGISwapChain2* _real2 = nullptr;

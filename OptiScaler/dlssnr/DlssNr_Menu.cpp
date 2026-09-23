@@ -41,12 +41,19 @@ void RenderMenu(Config* config, float menuResScale)
         if (ImGui::Checkbox("Enable Neural Rendering", &enabled))
             config->DlssNrEnabled = enabled;
 
-        ImGui::TextUnformatted("V23040 - Neural Rendering BEFORE super resolution");
-        HelpMarker("Processes the render input; super resolution reconstructs the enhanced result."
-                       "\n\nNeeds two similarly named files beside OptiScaler, one character apart:"
-                       "\n  nvngx_dlssnr.dll       NVIDIA's model (~165 MB) -- you supply it"
-                       "\n  nvngx.dll_dlssnr.dll   the unchanged V23029 forwarder"
-                       "\nUndocumented and driven directly, so none of this is officially supported.");
+        bool runBeforeSr = config->DlssNrRunBeforeSr.value_or_default();
+        if (ImGui::Checkbox("Run before super resolution", &runBeforeSr))
+            config->DlssNrRunBeforeSr = runBeforeSr;
+
+        ImGui::TextUnformatted(runBeforeSr ? "V23072 - Neural Rendering BEFORE super resolution"
+                                           : "V23072 - Neural Rendering AFTER super resolution");
+        HelpMarker(runBeforeSr
+                       ? "Processes the render input; super resolution reconstructs the enhanced result."
+                         "\n\nNeeds nvngx_dlssnr.dll and nvngx.dll_dlssnr.dll beside OptiScaler."
+                         "\nUndocumented and driven directly, so none of this is officially supported."
+                       : "Processes the completed super-resolution output."
+                         "\n\nNeeds nvngx_dlssnr.dll and nvngx.dll_dlssnr.dll beside OptiScaler."
+                         "\nUndocumented and driven directly, so none of this is officially supported.");
 
         // The toggle can be bound to a key, and nobody would think to look for it under Keybinds
         // unless told. Dimmed, because it is a note rather than a setting.
@@ -69,24 +76,7 @@ void RenderMenu(Config* config, float menuResScale)
         }
         else
         {
-            // The cost belongs here rather than only in the upscaler's breakdown: that tooltip needs
-            // OptiScaler's own upscaler to have run, and with native DLSS passing through there is
-            // nothing in it to hang this off.
-            const auto ms = DlssNr::LastGpuTime();
-
-            if (ms.has_value())
-                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Running before SR - %.2f ms per evaluation",
-                                   ms.value());
-            else
-                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Running.");
-
-            ImGui::SameLine();
-            ImGui::TextDisabled("(?)");
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                ImGui::SetTooltip("The whole pass: the staging copies and the resolve as well as the"
-                                  "\nmodel. Timing only the model would flatter the number."
-                                  "\n\nCompare it against the frame time at the bottom of this window to"
-                                  "\nsee what it is costing you.");
+            ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Running.");
         }
 
         ImGui::Spacing();
