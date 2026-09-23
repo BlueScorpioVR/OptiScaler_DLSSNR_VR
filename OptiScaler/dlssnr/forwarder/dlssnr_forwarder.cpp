@@ -235,8 +235,9 @@ __declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList *cmd, v
     setResource(capabilityParams, "DLSSNR.MVec", motion);
     setResource(capabilityParams, "DLSSNR.Output", output);
 
-    // The block is shared with the game's own DLSS, which overwrites these between frames, so every
-    // value the feature reads is set again here rather than relying on what create left behind.
+    // Every value read by this evaluation is written explicitly. The host gives each concurrently
+    // in-flight command-list identity its own block, so these writes cannot mutate another list's
+    // deferred NVIDIA work.
     setUInt(capabilityParams, "DLSSNR.Enabled", 1);
     setUInt(capabilityParams, "DLSSNR.Width", width);
     setUInt(capabilityParams, "DLSSNR.Height", height);

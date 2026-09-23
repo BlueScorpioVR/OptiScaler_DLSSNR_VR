@@ -58,6 +58,19 @@ enum class BridgeFlightOperation : std::uint32_t {
     nvidia_eye_execute,
     nvidia_composite_submit,
     embedded_configuration,
+    // Sampled FSR diagnostics. These records are emitted only while the
+    // bridge flight logger is enabled, on the first Cinema pair and then once
+    // every 120 pairs. Together they preserve the per-eye association between
+    // the OpenXR view, OptiScaler DLSS stream and FSR inputs without adding
+    // per-frame disk traffic.
+    fsr_eye_binding,
+    fsr_eye_resources,
+    fsr_eye_rects,
+    fsr_eye_motion,
+    fsr_eye_pose,
+    fsr_eye_orientation,
+    fsr_eye_fov,
+    fsr_eye_clip_vertex,
 };
 
 struct BridgeFlightToken {

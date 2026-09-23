@@ -31,6 +31,11 @@ struct StreamState {
     float jitter_x{};
     float jitter_y{};
     std::shared_ptr<const DlssMotionVectorFrame> latest;
+    // Output colour is consumed on the same direct queue after both eye
+    // publications. One private surface per stream is therefore sufficient:
+    // queue order is copy current eye -> synthesize -> copy next frame. A
+    // four-deep full-resolution ring multiplied memory by both eyes and could
+    // exhaust residency precisely when the FSR contexts came online.
     std::array<SnapshotSlot, kSnapshotSlotCount> snapshots;
     std::size_t next_snapshot{};
     std::array<SnapshotSlot, kSnapshotSlotCount> depth_snapshots;
@@ -126,14 +131,16 @@ D3D12_RESOURCE_BARRIER transition_barrier(
     return barrier;
 }
 
+template <std::size_t SnapshotCount>
 HRESULT snapshot_resource(
-    std::array<SnapshotSlot, kSnapshotSlotCount>& snapshots,
+    std::array<SnapshotSlot, SnapshotCount>& snapshots,
     std::size_t& next_snapshot,
     ID3D12Resource* source,
     D3D12_RESOURCE_STATES source_state,
     ID3D12GraphicsCommandList* producer_command_list,
     ID3D12CommandQueue* producer_queue,
-    ComPtr<ID3D12Resource>* snapshot) noexcept {
+    ComPtr<ID3D12Resource>* snapshot,
+    D3D12_RESOURCE_STATES snapshot_state = kSnapshotReadState) noexcept {
     if (source == nullptr || producer_command_list == nullptr ||
         producer_queue == nullptr || snapshot == nullptr) return E_POINTER;
     snapshot->Reset();
@@ -202,11 +209,11 @@ HRESULT snapshot_resource(
             source_state);
     }
     after[after_count++] = transition_barrier(
-        slot.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kSnapshotReadState);
+        slot.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, snapshot_state);
     producer_command_list->ResourceBarrier(after_count, after.data());
-    slot.state = kSnapshotReadState;
+    slot.state = snapshot_state;
     *snapshot = slot.resource;
-    next_snapshot = (next_snapshot + 1) % kSnapshotSlotCount;
+    next_snapshot = (next_snapshot + 1) % SnapshotCount;
     return S_OK;
 }
 
@@ -268,6 +275,8 @@ void publish_dlss_motion_vectors(
         frame->previous_serial = stream.serial;
         frame->serial = ++stream.serial;
         frame->publication = ++state.statistics.published;
+        // Identity/extent only. Colour for synthesis always comes from the
+        // bridge-owned final XR image, never this mutable DLSS output.
         frame->output = publication.output;
         frame->motion_vectors = std::move(motion_snapshot);
         frame->producer_queue = publication.producer_queue;

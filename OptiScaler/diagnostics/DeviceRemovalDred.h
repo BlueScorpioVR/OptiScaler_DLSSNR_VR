@@ -187,7 +187,7 @@ class Monitor
         {
             if (!flightHeaderWritten)
             {
-                file_.Line("nr_flight_begin version=V23080 first=%llu end=%llu capacity=%zu",
+                file_.Line("nr_flight_begin version=V23216 first=%llu end=%llu capacity=%zu",
                            first, end, capacity);
                 flightHeaderWritten = true;
             }
@@ -269,7 +269,7 @@ class Monitor
         monitor->device_ = device;
         SYSTEMTIME now {}; GetSystemTime(&now);
         wchar_t name[180];
-        swprintf_s(name, L"optiscaler-dred-V23080-%04u%02u%02u-%02u%02u%02u-%lu-device%u.log",
+        swprintf_s(name, L"optiscaler-dred-V23216-%04u%02u%02u-%02u%02u%02u-%lu-device%u.log",
                    now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
                    GetCurrentProcessId(), ++registry->id);
         monitor->path_ = directory / name;
@@ -277,7 +277,7 @@ class Monitor
         HRESULT result = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&monitor->fence_));
         if (FAILED(result))
         { monitor->file_.Line("arm_failed CreateFence=0x%08X", static_cast<unsigned>(result)); monitor->file_.Flush(); return {}; }
-        monitor->fence_->SetName(L"OptiScaler V23080 device-removal notification only");
+        monitor->fence_->SetName(L"OptiScaler V23216 device-removal notification only");
         monitor->event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!monitor->event_)
         { monitor->file_.Line("arm_failed CreateEvent=%lu", GetLastError()); monitor->file_.Flush(); return {}; }
@@ -288,7 +288,7 @@ class Monitor
         if (FAILED(result))
         { monitor->file_.Line("arm_failed SetEventOnCompletion=0x%08X", static_cast<unsigned>(result)); monitor->file_.Flush(); return {}; }
         const auto luid = device->GetAdapterLuid();
-        monitor->file_.Line("armed version=V23080 pid=%lu device=%p adapter=%08X:%08X trigger=fence_device_removal",
+        monitor->file_.Line("armed version=V23216 pid=%lu device=%p adapter=%08X:%08X trigger=fence_device_removal",
                            GetCurrentProcessId(), static_cast<void*>(device.Get()),
                            static_cast<unsigned>(luid.HighPart), static_cast<unsigned>(luid.LowPart));
         monitor->file_.Flush();

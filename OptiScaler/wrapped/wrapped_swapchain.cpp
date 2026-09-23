@@ -429,13 +429,13 @@ WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain* real, IUnknown* p
     {
         _dredMonitor = DeviceRemovalDred::Monitor::Observe(pDevice, Util::DllPath().parent_path());
         if (_dredMonitor)
-            LOG_WARN("V23080 independent device-removal DRED armed: {}", _dredMonitor->Path().string());
+            LOG_WARN("V23216 independent device-removal DRED armed: {}", _dredMonitor->Path().string());
         else
-            LOG_WARN("V23080 device-removal observer unavailable (non-DX12 owner or setup failure)");
+            LOG_WARN("V23216 device-removal observer unavailable (non-DX12 owner or setup failure)");
     }
     catch (...)
     {
-        LOG_ERROR("V23080 device-removal observer setup exception");
+        LOG_ERROR("V23216 device-removal observer setup exception");
     }
     _lastFlags = flags;
 

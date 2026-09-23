@@ -316,9 +316,11 @@ private:
 [[nodiscard]] ComPtr<ID3D12Resource> create_source_texture(
     D3D12WarpFixture& fixture,
     UINT width = kWidth,
-    UINT height = kHeight) {
+    UINT height = kHeight,
+    DXGI_FORMAT format = kFormat) {
     const D3D12_HEAP_PROPERTIES properties = heap_properties(D3D12_HEAP_TYPE_DEFAULT);
-    const D3D12_RESOURCE_DESC description = stereo_texture_description(width, height);
+    D3D12_RESOURCE_DESC description = stereo_texture_description(width, height);
+    description.Format = format;
     ComPtr<ID3D12Resource> texture;
     require_hresult(
         fixture.device()->CreateCommittedResource(
@@ -2556,18 +2558,17 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
             "create DLSS provenance texture");
         return texture;
     };
-    const auto left_output = create_texture(width, height, 1);
-    const auto right_output = create_texture(width, height, 1);
+    const auto shared_output = create_texture(width, height, 1);
     const auto motion = create_texture(width / 2, height / 2, 1);
     const auto xr_output = create_texture(width, height, 2);
 
     fixture.execute_and_wait([&](ID3D12GraphicsCommandList* command_list) {
         xrfg::publish_dlss_motion_vectors({
-            101, left_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
+            101, shared_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
             0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
             D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
         xrfg::publish_dlss_motion_vectors({
-            202, right_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
+            202, shared_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
             0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
             D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
     });
@@ -2581,6 +2582,8 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
             resolved->eyes[1]->motion_vectors.Get() != motion.Get() &&
             resolved->eyes[0]->motion_vectors.Get() !=
                 resolved->eyes[1]->motion_vectors.Get() &&
+            resolved->eyes[0]->output.Get() == shared_output.Get() &&
+            resolved->eyes[1]->output.Get() == shared_output.Get() &&
             resolved->eyes[0]->output_slice == 0 &&
             resolved->eyes[1]->output_slice == 0,
         "two DLSS streams were not associated with the XR stereo image");
@@ -2589,11 +2592,11 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
     // stable first-seen stream order, not to this frame's evaluation order.
     fixture.execute_and_wait([&](ID3D12GraphicsCommandList* command_list) {
         xrfg::publish_dlss_motion_vectors({
-            202, right_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
+            202, shared_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
             0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
             D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
         xrfg::publish_dlss_motion_vectors({
-            101, left_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
+            101, shared_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
             0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
             D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
     });
@@ -2602,7 +2605,10 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
     require(reordered && reordered->eyes[0]->stream == 101 &&
             reordered->eyes[1]->stream == 202 &&
             reordered->eyes[0]->serial == 2 &&
-            reordered->eyes[1]->serial == 2,
+            reordered->eyes[1]->serial == 2 &&
+            reordered->eyes[0]->output.Get() == resolved->eyes[0]->output.Get() &&
+            reordered->eyes[1]->output.Get() == resolved->eyes[1]->output.Get() &&
+            reordered->eyes[0]->output.Get() == reordered->eyes[1]->output.Get(),
         "DLSS stream pairing changed eye assignment with evaluation order");
 
     const auto tracked = xrfg::dlss_motion_vector_statistics();
@@ -2618,7 +2624,7 @@ void test_dlss_motion_vector_stereo_stream_pairing(D3D12WarpFixture& fixture) {
         "DLSS stream diagnostics did not retain the last successful use");
     fixture.execute_and_wait([&](ID3D12GraphicsCommandList* command_list) {
         xrfg::publish_dlss_motion_vectors({
-            101, left_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
+            101, shared_output.Get(), motion.Get(), fixture.queue(), 0, 0, width, height,
             0, 0, width / 2, height / 2, 1.0F, 1.0F, 0.0F, 0.0F,
             D3D12_RESOURCE_STATE_COMMON, false, false, command_list});
     });
@@ -3287,6 +3293,55 @@ void test_double_wide_single_slice_views(
 }
 
 #include "nvidia_fast_patterns.inc"
+#include "cinema_color_contract.inc"
+
+// Static encoded grey must not brighten only on the generated frame. A
+// typeless resource is deliberate: the XR negotiated view, not GetDesc(),
+// determines whether texture sampling must decode sRGB.
+void test_srgb_synthesis_preserves_brightness(
+    D3D12WarpFixture& fixture,
+    xrfg::D3D12OpticalFlowBackend backend = xrfg::D3D12OpticalFlowBackend::fidelity_fx) {
+    constexpr UINT width = 256, height = 128;
+    constexpr DXGI_FORMAT storage = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    auto a = create_source_texture(fixture, width, height, storage);
+    auto b = create_source_texture(fixture, width, height, storage);
+    auto real_a = create_source_texture(fixture, width, height, storage);
+    auto real_b = create_source_texture(fixture, width, height, storage);
+    auto synthetic = create_source_texture(fixture, width, height, storage);
+    std::array<ID3D12Resource*, 2> sources{a.Get(), b.Get()};
+    std::array<ID3D12Resource*, 2> real{real_a.Get(), real_b.Get()};
+    std::array<ID3D12Resource*, 1> generated{synthetic.Get()};
+    StereoPattern pattern = translated_motion_pattern(width, height, {0, 0});
+    for (auto& eye : pattern)
+        for (std::size_t i = 0; i < eye.size(); ++i)
+            eye[i] = (i % 4 == 3) ? 255 : 128;
+    upload_pattern(fixture, a.Get(), pattern);
+    upload_pattern(fixture, b.Get(), pattern);
+    auto history = std::make_shared<xrfg::D3D12SwapchainHistory>();
+    require(operation_succeeded(history->initialize(fixture.device(), fixture.queue(),
+        sources, D3D12_RESOURCE_STATE_RENDER_TARGET)), "sRGB history init failed");
+    xrfg::D3D12FrameSynthesizer synth;
+    require(operation_succeeded(synth.initialize(fixture.device(), fixture.queue(),
+        history, real, generated, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        D3D12_RESOURCE_STATE_RENDER_TARGET, backend)), "sRGB synthesis init failed");
+    const auto views = make_reprojection_views();
+    xrfg::D3D12HistoryCaptureTicket ca{}, cb{};
+    xrfg::D3D12FrameSynthesisTicket prime{}, pair{};
+    require(operation_succeeded(history->capture(0, &ca)) &&
+        operation_succeeded(history->commit(ca)) &&
+        operation_succeeded(synth.submit_prime(ca, views, 0, &prime)), "sRGB prime failed");
+    require(operation_succeeded(history->capture(1, &cb)) &&
+        operation_succeeded(history->commit(cb)) &&
+        operation_succeeded(synth.submit_pair(cb, views, views, 0, 1, &pair)), "sRGB pair failed");
+    const auto actual = readback_pattern(fixture, synthetic.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const auto real_output = readback_pattern(fixture, real_b.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+    require(real_output == pattern, "sRGB real frame changed");
+    for (UINT eye = 0; eye < kEyeCount; ++eye) {
+        const auto error = mean_absolute_rgb_error(actual, pattern, width, height, eye, 16);
+        std::cout << "sRGB synthetic brightness error eye=" << eye << " MAE=" << error << '\n';
+        require(error <= 1.0, "synthetic sRGB brightness differs from real frame");
+    }
+}
 
 }  // namespace
 
@@ -3306,6 +3361,8 @@ int main() {
             return 0;
         }
         D3D12WarpFixture fixture;
+        test_cinema_color_contract(fixture);
+        test_srgb_synthesis_preserves_brightness(fixture);
         test_stereo_capture_ring(fixture);
         test_capture_is_async_and_consumer_fence_blocks_reuse(fixture);
         test_depth_capture_path(fixture);
@@ -3363,6 +3420,8 @@ int main() {
             nvidia_options.bidirectional = bidirectional_length == 1 &&
                 bidirectional[0] == '1';
             D3D12WarpFixture nvidia_fixture(true);
+            test_srgb_synthesis_preserves_brightness(nvidia_fixture,
+                xrfg::D3D12OpticalFlowBackend::nvidia);
             test_stereo_motion_synthesis_beats_same_pixel_blend(
                 nvidia_fixture,
                 xrfg::D3D12OpticalFlowBackend::nvidia,

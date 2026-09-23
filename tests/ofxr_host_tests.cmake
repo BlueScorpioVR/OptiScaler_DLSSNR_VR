@@ -24,6 +24,7 @@ foreach(mode inline flight steamvr d3d11)
 endforeach()
 
 add_executable(xrfg_embedded_reconfigure_gpu_tests "${CMAKE_CURRENT_LIST_DIR}/../third_party/ofxr/tests/embedded_reconfigure_gpu_tests.cpp")
+target_include_directories(xrfg_embedded_reconfigure_gpu_tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated-shaders")
 target_link_libraries(xrfg_embedded_reconfigure_gpu_tests PRIVATE xrfg_d3d12_history xrfg_bridge_flight_logger)
 target_compile_definitions(xrfg_embedded_reconfigure_gpu_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 # Deliberately manual: requires an NVIDIA OFA-capable GPU. Not portable WARP CI.

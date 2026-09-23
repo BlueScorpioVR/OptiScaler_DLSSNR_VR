@@ -37,6 +37,13 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
                           NVSDK_NGX_Parameter* params,
                           ID3D12CommandQueue* timingQueue = nullptr);
 
+// Called by the D3D12 queue hook after a batch has actually been submitted. NR records work into
+// command lists owned by the game, so this is the first point where a fence can be attached to that
+// work. The next evaluate for the same source handle will not reuse the NVIDIA feature or its scratch
+// surfaces until this fence has retired.
+void NotifyCommandListsSubmitted(ID3D12CommandQueue* queue, unsigned int commandListCount,
+                                 ID3D12CommandList* const* commandLists);
+
 // Retires the model feature and resources associated with one source upscaler handle. The resources
 // are parked rather than destroyed immediately because the GPU can still reference them.
 void ReleaseForHandle(unsigned int sourceHandleId);

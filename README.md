@@ -7,12 +7,13 @@
 <br />
 
 > [!NOTE]
-> This fork adds VR-aware DLSS Neural Rendering for games that render the left
-> and right eye through separate, alternating DLSS handles. Each eye keeps its
-> own model feature, resources and temporal history. The current preview runs
-> Neural Rendering on the render-resolution `Color` input **before** DLSS Super
-> Resolution, then lets SR reconstruct the enhanced image. It was developed for
-> Witcher3VR; wider game and API compatibility is experimental.
+> This fork adds VR-aware DLSS Neural Rendering and an experimental **OFXR VR
+> Framegen** path for games that render the left and right eye through separate,
+> alternating DLSS handles. Each eye keeps its own model feature, resources and
+> temporal history. Neural Rendering can run before or after DLSS Super
+> Resolution, while the OFXR path can consume the game's DLSS depth and motion
+> data for OpenXR-aware frame generation. It was developed for Witcher3VR;
+> wider game, runtime and API compatibility is experimental.
 >
 > The pre-SR route is adapted from
 > [sadbee166's OptiScaler_DLSSNR PR #6](https://github.com/Dagherbou/OptiScaler_DLSSNR/pull/6),
@@ -21,11 +22,11 @@
 > parameter restoration and bounded non-UAV color copy needed by this build.
 
 > [!WARNING]
-> This is an unofficial experimental preview. It may fail, corrupt the image or
-> crash. It currently targets ordinary DLSS Super Resolution with separate,
-> zero-origin D3D12 color/depth/motion inputs. DLSS Ray Reconstruction is not
-> supported by this route. NVIDIA's proprietary `nvngx_dlssnr.dll` is not
-> included and must be supplied separately.
+> This is an unofficial experimental preview (internal head **V23218**). It may
+> fail, corrupt the image or crash. It currently targets ordinary DLSS Super
+> Resolution with separate D3D12 color/depth/motion inputs. DLSS Ray
+> Reconstruction is not supported by this route. NVIDIA's proprietary
+> `nvngx_dlssnr.dll` is not included and must be supplied separately.
 
 <div align="center">
   <a href="https://github.com/sponsors/cdozdil?frequency=one-time"><img src="images/gh-sponsor-red.png" /></a>

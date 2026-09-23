@@ -120,6 +120,10 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     set(XRFG_FULLSCREEN_VERTEX_HEADER "${XRFG_GENERATED_SHADER_DIR}/fullscreen_vertex_shader.hpp")
     set(XRFG_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/synthesize_midpoint_pixel_shader.hpp")
     set(XRFG_REPROJECT_GENERATED_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/reproject_generated_pixel_shader.hpp")
+    set(XRFG_FSR_CINEMA_VERTEX_HEADER "${XRFG_GENERATED_SHADER_DIR}/fsr_cinema_vertex_shader.hpp")
+    set(XRFG_FSR_CINEMA_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/fsr_cinema_pixel_shader.hpp")
+    set(XRFG_CINEMA_FLATTEN_VERTEX_HEADER "${XRFG_GENERATED_SHADER_DIR}/cinema_flatten_vertex_shader.hpp")
+    set(XRFG_CINEMA_FLATTEN_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/cinema_flatten_pixel_shader.hpp")
     set(XRFG_NVIDIA_PACK_INPUT_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_pack_flow_input_shader.hpp")
     set(XRFG_NVIDIA_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_synthesize_midpoint_pixel_shader.hpp")
     set(XRFG_NVIDIA_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_bidirectional_synthesize_midpoint_pixel_shader.hpp")
@@ -131,6 +135,10 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             "${XRFG_FULLSCREEN_VERTEX_HEADER}"
             "${XRFG_SYNTHESIZE_PIXEL_HEADER}"
             "${XRFG_REPROJECT_GENERATED_PIXEL_HEADER}"
+            "${XRFG_FSR_CINEMA_VERTEX_HEADER}"
+            "${XRFG_FSR_CINEMA_PIXEL_HEADER}"
+            "${XRFG_CINEMA_FLATTEN_VERTEX_HEADER}"
+            "${XRFG_CINEMA_FLATTEN_PIXEL_HEADER}"
             "${XRFG_NVIDIA_PACK_INPUT_HEADER}"
             "${XRFG_NVIDIA_SYNTHESIZE_PIXEL_HEADER}"
             "${XRFG_NVIDIA_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}"
@@ -153,10 +161,26 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_REPROJECT_GENERATED_PIXEL_HEADER}" /Vn g_xrfg_reproject_generated_pixel_shader
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+        COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T vs_5_1 /E CinemaPanelVS
+            /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
+            /Fh "${XRFG_FSR_CINEMA_VERTEX_HEADER}" /Vn g_xrfg_fsr_cinema_vertex_shader
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/fsr_cinema_projection.hlsl"
+        COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E CinemaPanelPS
+            /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
+            /Fh "${XRFG_FSR_CINEMA_PIXEL_HEADER}" /Vn g_xrfg_fsr_cinema_pixel_shader
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/fsr_cinema_projection.hlsl"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E PackNvidiaFlowInput
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_NVIDIA_PACK_INPUT_HEADER}" /Vn g_xrfg_nvidia_pack_flow_input_shader
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+        COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T vs_5_1 /E CinemaFlattenVS
+            /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
+            /Fh "${XRFG_CINEMA_FLATTEN_VERTEX_HEADER}" /Vn g_xrfg_cinema_flatten_vertex_shader
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/fsr_cinema_projection.hlsl"
+        COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E CinemaFlattenPS
+            /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
+            /Fh "${XRFG_CINEMA_FLATTEN_PIXEL_HEADER}" /Vn g_xrfg_cinema_flatten_pixel_shader
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/fsr_cinema_projection.hlsl"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E SynthesizeNvidiaMidpointPS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_NVIDIA_SYNTHESIZE_PIXEL_HEADER}" /Vn g_xrfg_nvidia_synthesize_midpoint_pixel_shader
@@ -173,7 +197,9 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_NVIDIA_FAST_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}" /Vn g_xrfg_nvidia_fast_bidirectional_synthesize_midpoint_pixel_shader
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+        DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/fsr_cinema_projection.hlsl"
         VERBATIM)
 
     add_library(xrfg_d3d12_history STATIC
@@ -187,6 +213,8 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         "${XRFG_FULLSCREEN_VERTEX_HEADER}"
         "${XRFG_SYNTHESIZE_PIXEL_HEADER}"
         "${XRFG_REPROJECT_GENERATED_PIXEL_HEADER}"
+        "${XRFG_FSR_CINEMA_VERTEX_HEADER}"
+        "${XRFG_FSR_CINEMA_PIXEL_HEADER}"
         "${XRFG_NVIDIA_PACK_INPUT_HEADER}"
         "${XRFG_NVIDIA_SYNTHESIZE_PIXEL_HEADER}"
         "${XRFG_NVIDIA_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}"
@@ -533,6 +561,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/layer_d3d11_interop_logging.cmake")
 
         add_executable(xrfg_d3d12_history_tests tests/d3d12_history_tests.cpp)
+        target_include_directories(xrfg_d3d12_history_tests PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated-shaders")
         target_include_directories(xrfg_d3d12_history_tests PRIVATE include)
         target_link_libraries(xrfg_d3d12_history_tests PRIVATE
             xrfg_d3d12_history
@@ -549,7 +578,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         add_test(NAME xrfg_d3d12_history_tests COMMAND xrfg_d3d12_history_tests)
 
         add_executable(xrfg_vertical_fov_tests tests/vertical_fov_tests.cpp)
-        target_include_directories(xrfg_vertical_fov_tests PRIVATE include)
+        target_include_directories(xrfg_vertical_fov_tests PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}/generated-shaders")
         target_link_libraries(xrfg_vertical_fov_tests PRIVATE xrfg_d3d12_history d3d12 dxgi)
         target_compile_features(xrfg_vertical_fov_tests PRIVATE cxx_std_20)
         if(MSVC)
@@ -558,7 +587,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         endif()
         add_test(NAME xrfg_vertical_fov_tests COMMAND xrfg_vertical_fov_tests)
         add_executable(xrfg_synthetic_marker_tests tests/synthetic_marker_tests.cpp)
-        target_include_directories(xrfg_synthetic_marker_tests PRIVATE include)
+        target_include_directories(xrfg_synthetic_marker_tests PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}/generated-shaders")
         target_link_libraries(xrfg_synthetic_marker_tests PRIVATE xrfg_d3d12_history d3d12 dxgi)
         target_compile_features(xrfg_synthetic_marker_tests PRIVATE cxx_std_20)
         if(MSVC)

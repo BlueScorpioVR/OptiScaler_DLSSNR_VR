@@ -79,11 +79,11 @@ static void EnableDredDiagnosticsOnce()
             settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             settings->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             settings->Release();
-            LOG_WARN("V23080 DRED auto-breadcrumbs, contexts and page-fault reporting enabled");
+            LOG_WARN("V23216 DRED auto-breadcrumbs, contexts and page-fault reporting enabled");
         }
         else
         {
-            LOG_WARN("V23080 could not enable DRED diagnostics: 0x{:X}", (uint32_t) result);
+            LOG_WARN("V23216 could not enable DRED diagnostics: 0x{:X}", (uint32_t) result);
         }
     });
 }
@@ -2238,7 +2238,9 @@ static void HookToDevice(ID3D12Device* InDevice)
     }
 
     HookToCommandList(InDevice);
-
+    // NR is independent of OptiScaler FG. Install only the queue-submission hook here, before the
+    // first DLSS feature can record NR work; the FG/HUD resource trackers remain gated below.
+    ResTrack_Dx12::HookQueueSubmission(InDevice);
     if (State::Instance().activeFgInput == FGInput::Upscaler &&
         !Config::Instance()->FGDisableHUDFix.value_or_default() &&
         State::Instance().swapchainInteropApi == SwapchainInteropApi::None)

@@ -55,7 +55,7 @@ static void TestWriter(const std::filesystem::path& root)
     const UINT zero = 0;
     D3D12_AUTO_BREADCRUMB_OP history[10] {};
     history[7] = D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER;
-    const wchar_t contextName[] = L"V23080 pre-SR NVIDIA NR model";
+    const wchar_t contextName[] = L"V23216 pre-SR NVIDIA NR model";
     D3D12_DRED_BREADCRUMB_CONTEXT context {6, contextName};
     // More than the retired collector's64 pending-node limit before the useful list.
     std::vector<D3D12_AUTO_BREADCRUMB_NODE1> nodes(81);
@@ -78,7 +78,7 @@ static void TestWriter(const std::filesystem::path& root)
     const auto text = Read(path);
     Check(text.find("node=80") < text.find("node=0 "), "partial node precedes pending nodes");
     Check(text.find("<NEXT>7:") != std::string::npos, "exact next operation");
-    Check(text.find("context_text=V23080 pre-SR NVIDIA NR model") != std::string::npos, "NR scope retained");
+    Check(text.find("context_text=V23216 pre-SR NVIDIA NR model") != std::string::npos, "NR scope retained");
     Check(text.find("partial=1 pending=80") != std::string::npos, "all pending lists counted");
 
     std::vector<D3D12_AUTO_BREADCRUMB_OP> ring(65536, D3D12_AUTO_BREADCRUMB_OP_DISPATCH);
@@ -108,7 +108,7 @@ static void TestLifetime(const std::filesystem::path& root)
     auto b = Monitor::Observe(queue.Get(), root);
     Check(a && a == b, "one observer per device across device and queue owners");
     const auto firstPath = a->Path();
-    Check(Read(firstPath).find("armed version=V23080") != std::string::npos, "armed receipt flushed");
+    Check(Read(firstPath).find("armed version=V23216") != std::string::npos, "armed receipt flushed");
     Sleep(50);
     Check(Read(firstPath).find("device_removed utc=") == std::string::npos, "no healthy notification");
     a.reset();
@@ -124,7 +124,7 @@ static void TestLifetime(const std::filesystem::path& root)
     next.reset();
     const auto report = Read(nextPath);
     Check(report.find("device_removed utc=") != std::string::npos, "removed receipt");
-    Check(report.find("nr_flight_begin version=V23080") != std::string::npos, "RAM flight ring persisted on removal");
+    Check(report.find("nr_flight_begin version=V23216") != std::string::npos, "RAM flight ring persisted on removal");
     Check(report.find("nr_flight_end") != std::string::npos, "RAM flight ring completed before DRED query");
     Check(report.find("breadcrumb_query=") != std::string::npos, "actual DRED queried");
     Check(report.find("page_fault_query=") != std::string::npos, "actual page fault data queried");

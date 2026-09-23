@@ -6,6 +6,7 @@
 #include "xrfg/generation_backpressure.hpp"
 #include "xrfg/implicit_layer.hpp"
 #include "xrfg/embedded_control.hpp"
+#include "xrfg/presentation_transform.h"
 #include <atomic>
 #include "xrfg/openxr_fps_overlay.hpp"
 
@@ -20,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -262,13 +264,14 @@ struct SessionState {
     std::optional<ProjectionSnapshot> previous_projection;
     XrTime generation_resume_display_time{};
     XrDuration minimum_runtime_display_period{};
-    std::uint32_t steamvr_throttled_wait_streak{};
+    std::uint8_t steamvr_throttled_wait_history{};
     xrfg::D3D12OpticalFlowBackend optical_flow_backend{
         xrfg::D3D12OpticalFlowBackend::fidelity_fx};
     xrfg::D3D12NvidiaOpticalFlowOptions nvidia_options{};
     xrfg::D3D12FrameGenerationMode frame_generation_mode{
         xrfg::D3D12FrameGenerationMode::ofxr};
     bool dlss_motion_vectors{};
+    xrfg::D3D12PresentationTransform presentation_transform{};
     SessionGraphicsBinding graphics_binding{SessionGraphicsBinding::none};
     std::uint64_t graphics_binding_capabilities{};
     Microsoft::WRL::ComPtr<ID3D11Device> d3d11_device;
@@ -429,6 +432,8 @@ struct SwapchainState {
     std::optional<xrfg::D3D12HistoryCaptureTicket> last_released_capture;
     std::shared_ptr<const xrfg::DlssMotionVectorSet> last_released_motion_vectors;
     std::shared_ptr<FrameGenerationSwapchainState> frame_generation;
+    bool presentation_transform_known{};
+    bool presentation_transform_active{};
 };
 
 void log_swapchain_eligibility(
@@ -1189,6 +1194,30 @@ XrResult expose_intercept(
     return XR_SUCCESS;
 }
 
+XRAPI_ATTR XrResult XRAPI_CALL layer_set_presentation_transform_ofxr(
+    XrSession session,
+    const XrfgPresentationTransformV1* transform) {
+    if (transform == nullptr ||
+        transform->version != XRFG_PRESENTATION_TRANSFORM_VERSION_1 ||
+        transform->view_count > 2U ||
+        (transform->active != 0U && transform->view_count == 0U)) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    const auto state = find_session(session);
+    if (!state) return XR_ERROR_HANDLE_INVALID;
+    std::scoped_lock lock(state->frame_call_mutex);
+    state->presentation_transform = {};
+    state->presentation_transform.active = transform->active != 0U;
+    state->presentation_transform.view_count = transform->view_count;
+    for (std::uint32_t view = 0; view < transform->view_count; ++view) {
+        std::copy_n(
+            transform->clip_positions[view],
+            state->presentation_transform.clip_positions[view].size(),
+            state->presentation_transform.clip_positions[view].begin());
+    }
+    return XR_SUCCESS;
+}
+
 XrResult layer_get_instance_proc_addr_impl(
     XrInstance instance,
     const char* name,
@@ -1206,6 +1235,13 @@ XrResult layer_get_instance_proc_addr_impl(
     const auto dispatch = find_dispatch(instance);
     if (!dispatch) {
         return instance == XR_NULL_HANDLE ? XR_ERROR_FUNCTION_UNSUPPORTED : XR_ERROR_HANDLE_INVALID;
+    }
+
+    if (std::strcmp(
+            name, XRFG_SET_PRESENTATION_TRANSFORM_FUNCTION_NAME) == 0) {
+        *function = reinterpret_cast<PFN_xrVoidFunction>(
+            layer_set_presentation_transform_ofxr);
+        return XR_SUCCESS;
     }
 
     if (std::strcmp(name, "xrDestroyInstance") == 0) {
@@ -1614,7 +1650,7 @@ void reset_frame_bookkeeping(const std::shared_ptr<SessionState>& state) {
         state->pending_frames.clear();
         state->previous_projection.reset();
         state->minimum_runtime_display_period = 0;
-        state->steamvr_throttled_wait_streak = 0;
+        state->steamvr_throttled_wait_history = 0;
     }
 }
 
@@ -3655,6 +3691,19 @@ struct PreparedProjectionFrame {
         }
 
         std::scoped_lock call_lock(state->call_mutex);
+        const xrfg::D3D12PresentationTransform presentation_transform =
+            state->session->presentation_transform;
+        if (!state->presentation_transform_known) {
+            state->presentation_transform_known = true;
+            state->presentation_transform_active =
+                presentation_transform.active;
+            if (presentation_transform.active) request_pair = false;
+        } else if (state->presentation_transform_active !=
+                   presentation_transform.active) {
+            state->presentation_transform_active =
+                presentation_transform.active;
+            request_pair = false;
+        }
         std::shared_ptr<FrameGenerationSwapchainState> generation;
         std::optional<xrfg::D3D12HistoryCaptureTicket> capture;
         std::shared_ptr<const xrfg::DlssMotionVectorSet> motion_vectors;
@@ -3745,13 +3794,15 @@ struct PreparedProjectionFrame {
                                           generation->current.acquired_index,
                                           &ticket,
                                           debug_marker,
-                                          motion_vectors)
+                                          motion_vectors,
+                                          presentation_transform)
                                     : generation->synthesizer->submit_prime(
                                           *capture,
                                           current_source_views,
                                           generation->current.acquired_index,
                                           &ticket,
-                                          motion_vectors);
+                                          motion_vectors,
+                                          presentation_transform);
             }
             if (SUCCEEDED(submit_result) && generation->d3d11_interop) {
                 const auto publish_token = xrfg::bridge_flight_logger().begin(
@@ -4045,10 +4096,21 @@ struct InternalCycleResult {
     if (!state->dispatch->steamvr_runtime || !cycle.completed) {
         return false;
     }
+    if (state->frame_generation_mode ==
+        xrfg::D3D12FrameGenerationMode::fsr3) {
+        // A throttled SteamVR wait alone must not move embedded FSR away
+        // from the inline synthetic/current pair. The continuous presenter
+        // changes its pose/submission timeline and corrupts this route's
+        // first scene; genuine overlapping application waits retain their
+        // separate pipelined-presenter transition.
+        std::scoped_lock lock(state->mutex);
+        state->steamvr_throttled_wait_history = 0;
+        return false;
+    }
     const auto elapsed_nanoseconds =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             cycle.wait_elapsed).count();
-    std::uint32_t streak = 0;
+    std::uint32_t recent_throttled_waits = 0;
     XrDuration baseline = 0;
     bool throttled = false;
     {
@@ -4067,22 +4129,28 @@ struct InternalCycleResult {
             const XrDuration half_period = baseline / 2;
             throttled = elapsed_nanoseconds >= half_period;
         }
-        state->steamvr_throttled_wait_streak = throttled
-            ? state->steamvr_throttled_wait_streak + 1
-            : 0;
-        streak = state->steamvr_throttled_wait_streak;
+        // Intermittent SteamVR waits can throttle every other inline pair.
+        // Requiring three consecutive slow waits kept optical flow inline
+        // for 12 seconds in PID9324, although the presenter then sustained
+        // the full 90 Hz. Count actual blocked waits across eight completed
+        // cycles; short waits age out rather than erasing the evidence.
+        state->steamvr_throttled_wait_history = static_cast<std::uint8_t>(
+            (state->steamvr_throttled_wait_history << 1) |
+            (throttled ? 1u : 0u));
+        recent_throttled_waits = std::popcount(
+            static_cast<unsigned>(state->steamvr_throttled_wait_history));
     }
     if (throttled) {
         xrfg::bridge_flight_logger().event(
             xrfg::BridgeFlightOperation::presenter_transition,
-            streak,
+            recent_throttled_waits,
             elapsed_nanoseconds > 0
                 ? static_cast<std::uint64_t>(elapsed_nanoseconds)
                 : 0,
             static_cast<std::uint64_t>(cycle.predicted_display_period),
             static_cast<std::uint64_t>(baseline));
     }
-    return streak >= 3;
+    return recent_throttled_waits >= 3;
 }
 
 void consume_application_frame(
@@ -4329,7 +4397,7 @@ XrResult layer_end_frame_impl(
         if (use_continuous_presenter && !pipelined_presenter_mode) {
             stop_continuous_presenter(state);
             std::scoped_lock lock(state->mutex);
-            state->steamvr_throttled_wait_streak = 0;
+            state->steamvr_throttled_wait_history = 0;
         }
         return end_result;
     }
@@ -4384,7 +4452,7 @@ XrResult layer_end_frame_impl(
         if (use_continuous_presenter && !pipelined_presenter_mode) {
             stop_continuous_presenter(state);
             std::scoped_lock lock(state->mutex);
-            state->steamvr_throttled_wait_streak = 0;
+            state->steamvr_throttled_wait_history = 0;
         }
         return end_result;
     }
@@ -4572,7 +4640,7 @@ XrResult layer_end_frame_impl(
         !pipelined_presenter_mode) {
         stop_continuous_presenter(state);
         std::scoped_lock lock(state->mutex);
-        state->steamvr_throttled_wait_streak = 0;
+        state->steamvr_throttled_wait_history = 0;
     }
 
     consume_application_frame(

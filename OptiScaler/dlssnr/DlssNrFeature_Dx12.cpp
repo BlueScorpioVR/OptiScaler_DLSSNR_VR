@@ -21,7 +21,9 @@
 
 #include <mutex>
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <unordered_set>
 
 namespace
 {
@@ -212,10 +214,15 @@ struct NrPerHandle
 {
     void* feature = nullptr;
 
-    // NGX parameter tables are mutable call state. Each eye/feature owns one permanently so an
-    // evaluate for the other eye (or the game's native DLSS evaluate) can never rewrite the table
-    // while NVIDIA still has commands in flight for this feature.
+    // Creation state stays owned by the feature for its complete lifetime.
     NVSDK_NGX_Parameter* params = nullptr;
+
+    // NGX evaluate parameters are mutable call state. Per-handle ownership fixed cross-eye
+    // mutation, but still reused one table while several command lists from the same eye were in
+    // flight. Keying the table by command-list identity makes its lifetime follow D3D12's own
+    // allocator/list retirement rule: the game cannot legally reset and reuse that list until its
+    // previous GPU execution has completed.
+    std::unordered_map<ID3D12GraphicsCommandList*, NVSDK_NGX_Parameter*> evaluateParams;
 
     // The model cannot read and write one resource, so the frame is staged through these.
     ID3D12Resource* colorCopy = nullptr;
@@ -270,6 +277,100 @@ NrRuntime g_runtime;
 int g_capabilityFloatSlot = -1;
 std::unordered_map<unsigned int, NrPerHandle> g_nrByHandle;
 std::unique_ptr<DlssNr_Dx12> g_compose;
+
+// NVIDIA NR owns mutable state behind each feature handle. Recording the next evaluate while the
+// previous evaluate for that same handle is still executing is normally hidden by the game's short
+// queue. OFXR deliberately deepens that queue, exposing the driver's internal reuse and eventually
+// hanging in the signed model's ResourceBarrier sequence. Parameters and descriptors were already
+// made immutable in V23070/V23214; the feature and its scratch surfaces are the remaining per-handle
+// state. Track the actual game submission and retire it before that handle is recorded again.
+struct NrHandleFlight
+{
+    bool awaitingSubmission = false;
+    ID3D12GraphicsCommandList* recordedList = nullptr;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    unsigned long long fenceValue = 0;
+};
+
+struct NrQueueFence
+{
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    unsigned long long nextValue = 0;
+};
+
+std::mutex g_nrFlightMutex;
+std::unordered_map<unsigned int, NrHandleFlight> g_nrFlights;
+std::unordered_map<ID3D12GraphicsCommandList*, std::unordered_set<unsigned int>> g_nrRecordedLists;
+std::unordered_map<ID3D12CommandQueue*, NrQueueFence> g_nrQueueFences;
+std::atomic<unsigned long long> g_nrRetirementSkips { 0 };
+std::atomic<bool> g_nrRetirementSignalFailed { false };
+
+void MarkNrRecorded(unsigned int sourceHandleId, ID3D12GraphicsCommandList* commandList)
+{
+    if (commandList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_nrFlightMutex);
+    NrHandleFlight& flight = g_nrFlights[sourceHandleId];
+    flight.awaitingSubmission = true;
+    flight.recordedList = commandList;
+    g_nrRecordedLists[commandList].insert(sourceHandleId);
+}
+
+bool RetirePreviousNrEvaluate(unsigned int sourceHandleId)
+{
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    unsigned long long fenceValue = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_nrFlightMutex);
+        const auto found = g_nrFlights.find(sourceHandleId);
+        if (found == g_nrFlights.end())
+            return true;
+
+        if (found->second.awaitingSubmission)
+        {
+            const auto skipped = ++g_nrRetirementSkips;
+            if (skipped == 1 || (skipped % 120) == 0)
+                LOG_WARN("V23216 DLSS-NR skipped handle {}: its previous command list has not been submitted yet (skip {})",
+                         sourceHandleId, skipped);
+            return false;
+        }
+
+        fence = found->second.fence;
+        fenceValue = found->second.fenceValue;
+    }
+
+    if (fence == nullptr || fenceValue == 0 || fence->GetCompletedValue() >= fenceValue)
+        return true;
+
+    // Same-eye evaluates are normally about two game frames apart, so the fence is already complete.
+    // Give a temporarily deep queue a small chance to drain; if it does not, skip this NR evaluate
+    // instead of either stalling the render thread or reusing in-flight NVIDIA state.
+    HANDLE eventHandle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (eventHandle != nullptr)
+    {
+        const HRESULT setResult = fence->SetEventOnCompletion(fenceValue, eventHandle);
+        if (SUCCEEDED(setResult))
+        {
+            const DWORD waitResult = WaitForSingleObject(eventHandle, 8);
+            CloseHandle(eventHandle);
+            if (waitResult == WAIT_OBJECT_0)
+                return true;
+        }
+        else
+        {
+            CloseHandle(eventHandle);
+        }
+    }
+
+    const auto skipped = ++g_nrRetirementSkips;
+    if (skipped == 1 || (skipped % 120) == 0)
+        LOG_WARN("V23216 DLSS-NR skipped handle {}: previous GPU evaluate has not retired (skip {})",
+                 sourceHandleId, skipped);
+    return false;
+}
 
 // Writes matched before/after frames on request, so comparisons stop depending on video.
 capture::FrameCapture g_capture;
@@ -452,6 +553,53 @@ bool EnsureHandleParams(NrPerHandle& nr, ID3D12Device* device)
     return true;
 }
 
+NVSDK_NGX_Parameter* EvaluateParamsForCommandList(
+    NrPerHandle& nr,
+    ID3D12GraphicsCommandList* commandList,
+    ID3D12Device* device)
+{
+    if (commandList == nullptr || device == nullptr)
+        return nullptr;
+
+    const auto found = nr.evaluateParams.find(commandList);
+    if (found != nr.evaluateParams.end())
+        return found->second;
+
+    if (!NVNGXProxy::IsDx12Inited() && !NVNGXProxy::InitDx12(device))
+    {
+        g_runtime.reason = "the NGX core would not initialise";
+        return nullptr;
+    }
+
+    if (NVNGXProxy::D3D12_GetCapabilityParameters() == nullptr ||
+        NVNGXProxy::D3D12_DestroyParameters() == nullptr)
+    {
+        g_runtime.reason = "the NGX core cannot own per-command-list evaluate parameters";
+        return nullptr;
+    }
+
+    NVSDK_NGX_Parameter* params = nullptr;
+    if (NVNGXProxy::D3D12_GetCapabilityParameters()(&params) != NVSDK_NGX_Result_Success ||
+        params == nullptr)
+    {
+        g_runtime.reason = "the NGX core refused its per-command-list evaluate parameters";
+        return nullptr;
+    }
+
+    DiscoverFloatSlot(params);
+    if (g_capabilityFloatSlot < 0)
+    {
+        NVNGXProxy::D3D12_DestroyParameters()(params);
+        g_runtime.reason = "cannot safely write the per-command-list NR float parameters";
+        return nullptr;
+    }
+
+    nr.evaluateParams.emplace(commandList, params);
+    LOG_INFO("V23216 DLSS-NR acquired params {:X} for command list {:X}",
+             (size_t) params, (size_t) commandList);
+    return params;
+}
+
 // Works out which vtable slot this parameter block keeps floats in, by writing a known value through
 // each candidate and asking for it back through the header's typed getter. Only a slot that returns the
 // value it was given is accepted.
@@ -542,6 +690,16 @@ void ParkNrParams(NVSDK_NGX_Parameter*& params)
     g_nrRetired.push_back(r);
 }
 
+void ParkNrEvaluateParams(NrPerHandle& nr)
+{
+    for (auto& [unusedCommandList, params] : nr.evaluateParams)
+    {
+        (void) unusedCommandList;
+        ParkNrParams(params);
+    }
+    nr.evaluateParams.clear();
+}
+
 void TickNrRetired()
 {
     for (size_t i = 0; i < g_nrRetired.size();)
@@ -576,6 +734,7 @@ void ReleaseSurfacesIfFormatChanged(NrPerHandle& nr, DXGI_FORMAT needed)
 
     ParkNrFeature(nr.feature);
     ParkNrParams(nr.params);
+    ParkNrEvaluateParams(nr);
 
     for (ID3D12Resource** r :
          { &nr.output, &nr.colorCopy, &nr.hdrCopy, &nr.colorSmall, &nr.resolveCopy })
@@ -836,6 +995,68 @@ void ReportSkipOnce(const char* reason)
         LOG_INFO("DLSS-NR did not run: {}", reason);
 }
 
+void NotifyCommandListsSubmitted(ID3D12CommandQueue* queue, unsigned int commandListCount,
+                                 ID3D12CommandList* const* commandLists)
+{
+    if (queue == nullptr || commandLists == nullptr || commandListCount == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_nrFlightMutex);
+    std::unordered_set<unsigned int> submittedHandles;
+
+    for (unsigned int i = 0; i < commandListCount; ++i)
+    {
+        auto* graphicsList = static_cast<ID3D12GraphicsCommandList*>(commandLists[i]);
+        const auto recorded = g_nrRecordedLists.find(graphicsList);
+        if (recorded == g_nrRecordedLists.end())
+            continue;
+
+        submittedHandles.insert(recorded->second.begin(), recorded->second.end());
+        g_nrRecordedLists.erase(recorded);
+    }
+
+    if (submittedHandles.empty())
+        return;
+
+    NrQueueFence& queueFence = g_nrQueueFences[queue];
+    if (queueFence.fence == nullptr)
+    {
+        Microsoft::WRL::ComPtr<ID3D12Device> device;
+        if (FAILED(queue->GetDevice(IID_PPV_ARGS(device.ReleaseAndGetAddressOf()))) || device == nullptr ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                       IID_PPV_ARGS(queueFence.fence.ReleaseAndGetAddressOf()))))
+        {
+            g_nrRetirementSignalFailed.store(true, std::memory_order_release);
+            LOG_ERROR("V23216 DLSS-NR could not create its submission-retirement fence");
+            return;
+        }
+        queueFence.queue = queue;
+        LOG_INFO("V23216 DLSS-NR retirement fence attached to game queue {:X}", (size_t) queue);
+    }
+
+    const unsigned long long fenceValue = ++queueFence.nextValue;
+    const HRESULT signalResult = queue->Signal(queueFence.fence.Get(), fenceValue);
+    if (FAILED(signalResult))
+    {
+        g_nrRetirementSignalFailed.store(true, std::memory_order_release);
+        LOG_ERROR("V23216 DLSS-NR could not signal its submission-retirement fence: 0x{:X}",
+                  (unsigned int) signalResult);
+        return;
+    }
+
+    for (const unsigned int handleId : submittedHandles)
+    {
+        const auto found = g_nrFlights.find(handleId);
+        if (found == g_nrFlights.end())
+            continue;
+
+        found->second.awaitingSubmission = false;
+        found->second.recordedList = nullptr;
+        found->second.fence = queueFence.fence;
+        found->second.fenceValue = fenceValue;
+    }
+}
+
 void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList* cmdList,
                           NVSDK_NGX_Parameter* params, ID3D12CommandQueue* timingQueue)
 {
@@ -881,6 +1102,22 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
     // The source handle is the temporal identity. Witcher VR evaluates two same-sized DLSS features
     // in strict left/right alternation; keying only on dimensions made both eyes share one NR history.
     NrPerHandle& nr = g_nrByHandle[sourceHandleId];
+
+    if (g_nrRetirementSignalFailed.load(std::memory_order_acquire))
+    {
+        g_runtime.failed = true;
+        g_runtime.reason = "the NR submission-retirement fence failed";
+        LOG_ERROR("DLSS-NR unavailable: {}", g_runtime.reason);
+        device->Release();
+        return;
+    }
+
+    if (!RetirePreviousNrEvaluate(sourceHandleId))
+    {
+        nr.reset = true;
+        device->Release();
+        return;
+    }
 
     const D3D12_RESOURCE_DESC desc = target->GetDesc();
     const auto allocationWidth = (unsigned int) desc.Width;
@@ -1018,6 +1255,7 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
         // deep in work that references all of it.
         ParkNrFeature(nr.feature);
         ParkNrParams(nr.params);
+        ParkNrEvaluateParams(nr);
 
         // Only a resolution change invalidates the scratch textures. Tuning does not, and throwing
         // them away for it would mean a reallocation every time a slider moves.
@@ -1120,7 +1358,7 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
         LOG_INFO("V23070 DLSS-NR BEFORE SR handle {} running at {}x{}, guides {}x{} (preset {}, intensity {}, style {})",
                  sourceHandleId, width, height, guideWidth, guideHeight, nr.builtPreset,
                  nr.builtIntensity, nr.builtStyle);
-        LOG_INFO("V23080 pre-SR allocation {}x{}, SR output {}x{}, copy resolve {}, per-handle params {:X}, game params {:X}",
+        LOG_INFO("V23216 pre-SR allocation {}x{}, SR output {}x{}, copy resolve {}, create params {:X}, game params {:X}",
                  desc.Width, desc.Height, outputDesc.Width, outputDesc.Height, !targetSupportsUav,
                  (size_t) nr.params, (size_t) params);
         LOG_INFO("DLSS-NR contract: input/output {}x{}, native scale 1, upscaling off, create flags "
@@ -1130,6 +1368,7 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
         // Creating and evaluating a feature in the same command list is the dice-roll that hung the
         // GPU (every crash died on a creation frame). The creation goes through the game's own submit
         // first; the first evaluate happens next frame. One frame without the model is invisible.
+        MarkNrRecorded(sourceHandleId, cmdList);
         device->Release();
         return;
     }
@@ -1211,7 +1450,7 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
     encodeParams.Height = height;
 
     {
-        DredScope stage(cmdList, L"OptiScaler V23080 DLSS-NR pre-SR encode");
+        DredScope stage(cmdList, L"OptiScaler V23216 DLSS-NR pre-SR encode");
         g_compose->Dispatch(cmdList, encodeParams, target, nullptr, nullptr, nullptr, nullptr,
                             nr.colorCopy, nr.hdrCopy);
     }
@@ -1233,7 +1472,7 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
         down.Width = workWidth;
         down.Height = workHeight;
         {
-            DredScope stage(cmdList, L"OptiScaler V23080 DLSS-NR pre-SR downsample");
+            DredScope stage(cmdList, L"OptiScaler V23216 DLSS-NR pre-SR downsample");
             g_compose->Dispatch(cmdList, down, modelInput, nullptr, nullptr, nullptr, nullptr,
                                 nr.colorSmall, nullptr);
         }
@@ -1257,9 +1496,19 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
     // The vectors were scaled to full-frame pixels; the image the model reprojects is the working size.
     const float mvToWork = width != 0 ? (float) workWidth / (float) width : 1.0f;
 
-    g_runtime.setContract(nr.params, workWidth, workHeight, workWidth, workHeight, createFlags,
+    NVSDK_NGX_Parameter* const evaluateParams =
+        EvaluateParamsForCommandList(nr, cmdList, device);
+    if (evaluateParams == nullptr)
+    {
+        g_runtime.failed = true;
+        LOG_ERROR("DLSS-NR unavailable: {}", g_runtime.reason);
+        device->Release();
+        return;
+    }
+
+    g_runtime.setContract(evaluateParams, workWidth, workHeight, workWidth, workHeight, createFlags,
                           isHdrBuffer ? 1 : 0, 0);
-    SetExtras(nr.params, cfg, nullptr, nullptr, 0, 0, 0, 0);
+    SetExtras(evaluateParams, cfg, nullptr, nullptr, 0, 0, 0, 0);
 
     // The proxy path, when asked for. Same inputs, same model -- the difference is who calls it.
     //
@@ -1275,6 +1524,9 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
 
         nr.reset = false;
 
+        if (proxyResult == NVSDK_NGX_Result_Success)
+            MarkNrRecorded(sourceHandleId, cmdList);
+
         if (proxyResult != 1)
         {
             g_runtime.failed = true;
@@ -1289,9 +1541,9 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
 
     int result = 0;
     {
-        DredScope stage(cmdList, L"OptiScaler V23080 DLSS-NR pre-SR model");
+        DredScope stage(cmdList, L"OptiScaler V23216 DLSS-NR pre-SR model");
         result = g_runtime.evaluate(
-            cmdList, nr.feature, nr.params, modelInput, depthIn, motionIn, nr.output,
+            cmdList, nr.feature, evaluateParams, modelInput, depthIn, motionIn, nr.output,
             workWidth, workHeight, guideWidth, guideHeight, nr.guideDepthInverted ? 1 : 0,
             nr.reset ? 1 : 0, cfg.DlssNrIntensity.value_or_default(),
             (int) cfg.DlssNrStyle.value_or_default(), cfg.DlssNrLocalStructure.value_or_default(),
@@ -1299,6 +1551,9 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
             cfg.DlssNrAutoMask.value_or_default() ? 1 : 0, nr.guideMvScaleX * mvToWork,
             nr.guideMvScaleY * mvToWork);
     }
+
+    if (result == NVSDK_NGX_Result_Success)
+        MarkNrRecorded(sourceHandleId, cmdList);
 
     nr.reset = false;
 
@@ -1311,10 +1566,10 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
 
         // At INFO, because whether the model actually took a value is the only way to tell a
         // control that does nothing from one that is not being written.
-        auto report = [&nr](const char* name, float wrote)
+        auto report = [evaluateParams](const char* name, float wrote)
         {
             float value = 0.0f;
-            const NVSDK_NGX_Result r = nr.params->Get(name, &value);
+            const NVSDK_NGX_Result r = evaluateParams->Get(name, &value);
             LOG_INFO("DLSS-NR readback {} -> {} (we wrote {}, result 0x{:X})", name, value, wrote,
                      (uint32_t) r);
         };
@@ -1327,14 +1582,14 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
 
         unsigned int style = 0;
         const NVSDK_NGX_Result styleResult =
-            nr.params->Get("DLSSNR.Style", &style);
+            evaluateParams->Get("DLSSNR.Style", &style);
         LOG_DEBUG("DLSS-NR readback DLSSNR.Style -> {} (result 0x{:X})", style, (uint32_t) styleResult);
 
         // The preset is the last control whose arrival has never been checked, and three of them look
         // identical in play. Either it is not landing or the presets really are alike.
         unsigned int preset = 0;
         const NVSDK_NGX_Result presetResult =
-            nr.params->Get("DLSSNR.Hint.Render.Preset", &preset);
+            evaluateParams->Get("DLSSNR.Hint.Render.Preset", &preset);
         LOG_DEBUG("DLSS-NR readback DLSSNR.Hint.Render.Preset -> {} (result 0x{:X}, we wrote {})", preset,
                  (uint32_t) presetResult, cfg.DlssNrPreset.value_or_default());
 
@@ -1372,7 +1627,7 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
             Barrier(cmdList, target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, L"pre-SR-resolve-target-write");
         {
-            DredScope stage(cmdList, L"OptiScaler V23080 DLSS-NR pre-SR resolve");
+            DredScope stage(cmdList, L"OptiScaler V23216 DLSS-NR pre-SR resolve");
             g_compose->Dispatch(cmdList, resolveParams, modelInput, nr.output, nr.hdrCopy, motionIn,
                                 nullptr, resolveTarget, nullptr);
         }
@@ -1493,6 +1748,22 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
     // The source handle is the temporal identity. Witcher VR evaluates two same-sized DLSS features
     // in strict left/right alternation; keying only on dimensions made both eyes share one NR history.
     NrPerHandle& nr = g_nrByHandle[sourceHandleId];
+
+    if (g_nrRetirementSignalFailed.load(std::memory_order_acquire))
+    {
+        g_runtime.failed = true;
+        g_runtime.reason = "the NR submission-retirement fence failed";
+        LOG_ERROR("DLSS-NR unavailable: {}", g_runtime.reason);
+        device->Release();
+        return;
+    }
+
+    if (!RetirePreviousNrEvaluate(sourceHandleId))
+    {
+        nr.reset = true;
+        device->Release();
+        return;
+    }
 
     const D3D12_RESOURCE_DESC desc = target->GetDesc();
     const auto width = (unsigned int) desc.Width;
@@ -1615,6 +1886,7 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
         // deep in work that references all of it.
         ParkNrFeature(nr.feature);
         ParkNrParams(nr.params);
+        ParkNrEvaluateParams(nr);
 
         // Only a resolution change invalidates the scratch textures. Tuning does not, and throwing
         // them away for it would mean a reallocation every time a slider moves.
@@ -1711,6 +1983,7 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
         // Creating and evaluating a feature in the same command list is the dice-roll that hung the
         // GPU (every crash died on a creation frame). The creation goes through the game's own submit
         // first; the first evaluate happens next frame. One frame without the model is invisible.
+        MarkNrRecorded(sourceHandleId, cmdList);
         device->Release();
         return;
     }
@@ -1794,7 +2067,7 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
     Barrier(cmdList, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, L"post-SR-encode-source-ready");
     {
-        DredScope stage(cmdList, L"OptiScaler V23080 DLSS-NR post-SR encode");
+        DredScope stage(cmdList, L"OptiScaler V23216 DLSS-NR post-SR encode");
         g_compose->Dispatch(cmdList, encodeParams, target, nullptr, nullptr, nullptr, nullptr,
                             nr.colorCopy, nr.hdrCopy);
     }
@@ -1818,7 +2091,7 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
         down.Width = workWidth;
         down.Height = workHeight;
         {
-            DredScope stage(cmdList, L"OptiScaler V23080 DLSS-NR post-SR downsample");
+            DredScope stage(cmdList, L"OptiScaler V23216 DLSS-NR post-SR downsample");
             g_compose->Dispatch(cmdList, down, modelInput, nullptr, nullptr, nullptr, nullptr,
                                 nr.colorSmall, nullptr);
         }
@@ -1842,9 +2115,19 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
     // The vectors were scaled to full-frame pixels; the image the model reprojects is the working size.
     const float mvToWork = width != 0 ? (float) workWidth / (float) width : 1.0f;
 
-    g_runtime.setContract(nr.params, workWidth, workHeight, workWidth, workHeight, createFlags,
+    NVSDK_NGX_Parameter* const evaluateParams =
+        EvaluateParamsForCommandList(nr, cmdList, device);
+    if (evaluateParams == nullptr)
+    {
+        g_runtime.failed = true;
+        LOG_ERROR("DLSS-NR unavailable: {}", g_runtime.reason);
+        device->Release();
+        return;
+    }
+
+    g_runtime.setContract(evaluateParams, workWidth, workHeight, workWidth, workHeight, createFlags,
                           isHdrBuffer ? 1 : 0, 0);
-    SetExtras(nr.params, cfg, nullptr, nullptr, 0, 0, 0, 0);
+    SetExtras(evaluateParams, cfg, nullptr, nullptr, 0, 0, 0, 0);
 
     // The proxy path, when asked for. Same inputs, same model -- the difference is who calls it.
     //
@@ -1860,6 +2143,9 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
 
         nr.reset = false;
 
+        if (proxyResult == NVSDK_NGX_Result_Success)
+            MarkNrRecorded(sourceHandleId, cmdList);
+
         if (proxyResult != 1)
         {
             g_runtime.failed = true;
@@ -1874,9 +2160,9 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
 
     int result = 0;
     {
-        DredScope stage(cmdList, L"OptiScaler V23080 DLSS-NR post-SR model");
+        DredScope stage(cmdList, L"OptiScaler V23216 DLSS-NR post-SR model");
         result = g_runtime.evaluate(
-            cmdList, nr.feature, nr.params, modelInput, depthIn, motionIn, nr.output,
+            cmdList, nr.feature, evaluateParams, modelInput, depthIn, motionIn, nr.output,
             workWidth, workHeight, guideWidth, guideHeight, nr.guideDepthInverted ? 1 : 0,
             nr.reset ? 1 : 0, cfg.DlssNrIntensity.value_or_default(),
             (int) cfg.DlssNrStyle.value_or_default(), cfg.DlssNrLocalStructure.value_or_default(),
@@ -1884,6 +2170,9 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
             cfg.DlssNrAutoMask.value_or_default() ? 1 : 0, nr.guideMvScaleX * mvToWork,
             nr.guideMvScaleY * mvToWork);
     }
+
+    if (result == NVSDK_NGX_Result_Success)
+        MarkNrRecorded(sourceHandleId, cmdList);
 
     nr.reset = false;
 
@@ -1896,10 +2185,10 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
 
         // At INFO, because whether the model actually took a value is the only way to tell a
         // control that does nothing from one that is not being written.
-        auto report = [&nr](const char* name, float wrote)
+        auto report = [evaluateParams](const char* name, float wrote)
         {
             float value = 0.0f;
-            const NVSDK_NGX_Result r = nr.params->Get(name, &value);
+            const NVSDK_NGX_Result r = evaluateParams->Get(name, &value);
             LOG_INFO("DLSS-NR readback {} -> {} (we wrote {}, result 0x{:X})", name, value, wrote,
                      (uint32_t) r);
         };
@@ -1912,14 +2201,14 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
 
         unsigned int style = 0;
         const NVSDK_NGX_Result styleResult =
-            nr.params->Get("DLSSNR.Style", &style);
+            evaluateParams->Get("DLSSNR.Style", &style);
         LOG_DEBUG("DLSS-NR readback DLSSNR.Style -> {} (result 0x{:X})", style, (uint32_t) styleResult);
 
         // The preset is the last control whose arrival has never been checked, and three of them look
         // identical in play. Either it is not landing or the presets really are alike.
         unsigned int preset = 0;
         const NVSDK_NGX_Result presetResult =
-            nr.params->Get("DLSSNR.Hint.Render.Preset", &preset);
+            evaluateParams->Get("DLSSNR.Hint.Render.Preset", &preset);
         LOG_DEBUG("DLSS-NR readback DLSSNR.Hint.Render.Preset -> {} (result 0x{:X}, we wrote {})", preset,
                  (uint32_t) presetResult, cfg.DlssNrPreset.value_or_default());
 
@@ -1952,7 +2241,7 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
         Barrier(cmdList, nr.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, L"post-SR-model-output-ready");
         {
-            DredScope stage(cmdList, L"OptiScaler V23080 DLSS-NR post-SR resolve");
+            DredScope stage(cmdList, L"OptiScaler V23216 DLSS-NR post-SR resolve");
             g_compose->Dispatch(cmdList, resolveParams, modelInput, nr.output, nr.hdrCopy, motionIn,
                                 nullptr, target, nullptr);
         }
@@ -2040,6 +2329,7 @@ void ReleaseForHandle(unsigned int sourceHandleId)
     NrPerHandle& nr = it->second;
     ParkNrFeature(nr.feature);
     ParkNrParams(nr.params);
+    ParkNrEvaluateParams(nr);
 
     for (ID3D12Resource** r : { &nr.output, &nr.colorCopy, &nr.hdrCopy, &nr.colorSmall, &nr.resolveCopy,
                                 &nr.depthClone, &nr.motionClone })
@@ -2075,6 +2365,16 @@ void Shutdown()
         if (nr.params != nullptr && NVNGXProxy::D3D12_DestroyParameters() != nullptr)
             NVNGXProxy::D3D12_DestroyParameters()(nr.params);
 
+        if (NVNGXProxy::D3D12_DestroyParameters() != nullptr)
+        {
+            for (auto& [unusedCommandList, params] : nr.evaluateParams)
+            {
+                (void) unusedCommandList;
+                if (params != nullptr)
+                    NVNGXProxy::D3D12_DestroyParameters()(params);
+            }
+        }
+
         for (ID3D12Resource* r : { nr.output, nr.colorCopy, nr.hdrCopy, nr.colorSmall, nr.resolveCopy,
                                    nr.depthClone, nr.motionClone })
         {
@@ -2084,6 +2384,15 @@ void Shutdown()
     }
 
     g_nrByHandle.clear();
+
+    {
+        std::lock_guard<std::mutex> flightLock(g_nrFlightMutex);
+        g_nrRecordedLists.clear();
+        g_nrFlights.clear();
+        g_nrQueueFences.clear();
+    }
+    g_nrRetirementSkips.store(0, std::memory_order_release);
+    g_nrRetirementSignalFailed.store(false, std::memory_order_release);
 
     g_capture.release();
     g_compose.reset();

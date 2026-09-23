@@ -53,7 +53,7 @@ inline void BeforeBarrier(ID3D12GraphicsCommandList* commandList, const wchar_t*
 
     wchar_t marker[256] {};
     NrFlightTrace::BarrierBefore(commandList, role, resource, before, after);
-    swprintf_s(marker, L"OptiScaler V23080 NR barrier role=%ls resource=%p before=0x%08X after=0x%08X",
+    swprintf_s(marker, L"OptiScaler V23216 NR barrier role=%ls resource=%p before=0x%08X after=0x%08X",
                role == nullptr ? L"unspecified" : role, static_cast<void*>(resource),
                static_cast<unsigned int>(before), static_cast<unsigned int>(after));
     Set(commandList, marker);

@@ -60,7 +60,7 @@ static void MaybeLogOfxrGuideStatistics()
     if (s.published == 0) return;
     static std::atomic_uint64_t lastLoggedPublication { 0 };
     std::uint64_t previous = lastLoggedPublication.load(std::memory_order_relaxed);
-    if (s.published < previous + 240 ||
+    if ((previous != 0 && s.published < previous + 240) ||
         !lastLoggedPublication.compare_exchange_strong(
             previous, s.published, std::memory_order_relaxed))
         return;
@@ -1306,11 +1306,11 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
         if (HandleToFeature[handleId] == NVSDK_NGX_Feature_SuperSampling &&
             Config::Instance()->DlssNrRunBeforeSr.value_or_default())
             DlssNr::EvaluateBeforeUpscale(handleId, InCmdList, InParameters);
-        static constexpr wchar_t kSrBegin[] = L"OptiScaler V23080 DLSS SR begin";
-        static constexpr wchar_t kSrComplete[] = L"OptiScaler V23080 DLSS SR complete";
+        static constexpr wchar_t kSrBegin[] = L"OptiScaler V23216 DLSS SR begin";
+        static constexpr wchar_t kSrComplete[] = L"OptiScaler V23216 DLSS SR complete";
         DredMarkers::Set(InCmdList, kSrBegin);
         evalSuccess = feature->Evaluate(InCmdList, InParameters);
-        NrFlightTrace::Result(InCmdList, L"OptiScaler V23080 DLSS SR result", evalSuccess ? 1 : 0);
+        NrFlightTrace::Result(InCmdList, L"OptiScaler V23216 DLSS SR result", evalSuccess ? 1 : 0);
         DredMarkers::Set(InCmdList, kSrComplete);
         if (evalSuccess && HandleToFeature[handleId] == NVSDK_NGX_Feature_SuperSampling &&
             !Config::Instance()->DlssNrRunBeforeSr.value_or_default())
@@ -1413,12 +1413,12 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
                 cfg.DlssNrRunBeforeSr.value_or_default())
                 DlssNr::EvaluateBeforeUpscale(handleId, InCmdList, InParameters);
 
-            static constexpr wchar_t kNativeSrBegin[] = L"OptiScaler V23080 native DLSS SR begin";
-            static constexpr wchar_t kNativeSrComplete[] = L"OptiScaler V23080 native DLSS SR complete";
+            static constexpr wchar_t kNativeSrBegin[] = L"OptiScaler V23216 native DLSS SR begin";
+            static constexpr wchar_t kNativeSrComplete[] = L"OptiScaler V23216 native DLSS SR complete";
             DredMarkers::Set(InCmdList, kNativeSrBegin);
             NVSDK_NGX_Result result =
                 NVNGXProxy::D3D12_EvaluateFeature()(InCmdList, InFeatureHandle, InParameters, InCallback);
-            NrFlightTrace::Result(InCmdList, L"OptiScaler V23080 native DLSS SR result", result);
+            NrFlightTrace::Result(InCmdList, L"OptiScaler V23216 native DLSS SR result", result);
             DredMarkers::Set(InCmdList, kNativeSrComplete);
             LOG_DEBUG("Native DLSS EvaluateFeature result: 0x{:X}", (uint32_t) result);
 

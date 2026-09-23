@@ -85,6 +85,14 @@ constexpr std::uint64_t kMegabyte = 1024ull * 1024ull;
     case BridgeFlightOperation::nvidia_eye_execute: return "nvidia_eye_execute";
     case BridgeFlightOperation::nvidia_composite_submit: return "nvidia_composite_submit";
     case BridgeFlightOperation::embedded_configuration: return "embedded_configuration";
+    case BridgeFlightOperation::fsr_eye_binding: return "fsr_eye_binding";
+    case BridgeFlightOperation::fsr_eye_resources: return "fsr_eye_resources";
+    case BridgeFlightOperation::fsr_eye_rects: return "fsr_eye_rects";
+    case BridgeFlightOperation::fsr_eye_motion: return "fsr_eye_motion";
+    case BridgeFlightOperation::fsr_eye_pose: return "fsr_eye_pose";
+    case BridgeFlightOperation::fsr_eye_orientation: return "fsr_eye_orientation";
+    case BridgeFlightOperation::fsr_eye_fov: return "fsr_eye_fov";
+    case BridgeFlightOperation::fsr_eye_clip_vertex: return "fsr_eye_clip_vertex";
     }
     return "unknown";
 }

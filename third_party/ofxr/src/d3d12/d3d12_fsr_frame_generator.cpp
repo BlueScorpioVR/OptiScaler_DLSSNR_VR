@@ -35,6 +35,10 @@ DXGI_FORMAT linear_color_format(DXGI_FORMAT format) noexcept {
     case DXGI_FORMAT_B8G8R8A8_TYPELESS:
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
         return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
     default:
         return format;
     }
@@ -146,28 +150,6 @@ std::filesystem::path module_directory() noexcept {
     return std::filesystem::path(path.data()).parent_path();
 }
 
-Vec3 rotate(Quaternion q, Vec3 v) noexcept {
-    q = normalize(q);
-    const Vec3 cross_a{
-        q.y * v.z - q.z * v.y,
-        q.z * v.x - q.x * v.z,
-        q.x * v.y - q.y * v.x,
-    };
-    const Vec3 sum{
-        cross_a.x + q.w * v.x,
-        cross_a.y + q.w * v.y,
-        cross_a.z + q.w * v.z,
-    };
-    const Vec3 cross_b{
-        q.y * sum.z - q.z * sum.y,
-        q.z * sum.x - q.x * sum.z,
-        q.x * sum.y - q.y * sum.x,
-    };
-    return {v.x + 2.0F * cross_b.x,
-            v.y + 2.0F * cross_b.y,
-            v.z + 2.0F * cross_b.z};
-}
-
 }  // namespace
 
 struct D3D12FsrFrameGenerator::Impl {
@@ -253,10 +235,17 @@ struct D3D12FsrFrameGenerator::Impl {
 
     HRESULT ensure_array() noexcept {
         D3D12_RESOURCE_DESC description = array_description;
-        // Preserve the OpenXR resource's typeless family so its original
-        // UNORM or sRGB view remains legal. The per-eye FSR output is the
-        // corresponding linear typed member and is copy-compatible.
-        description.Format = array_description.Format;
+        // Keep the generated image in the FSR input colour domain. Cinema
+        // colour is the final XR image pulled back to the original guide plane;
+        // it is display-encoded before FSR and decoded by the final panel draw.
+        description.Format = color_format;
+        // The copy target is later sampled in either the XR sRGB domain or
+        // the raw cinema domain. Typeless 8-bit storage permits both legal
+        // views without changing the FSR context/UAV format or the pixels.
+        if (color_format == DXGI_FORMAT_R8G8B8A8_UNORM)
+            description.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        else if (color_format == DXGI_FORMAT_B8G8R8A8_UNORM)
+            description.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
         description.Flags = D3D12_RESOURCE_FLAG_NONE;
         if (generated_array &&
             same_shape(generated_array->GetDesc(), description)) return S_OK;
@@ -337,6 +326,29 @@ struct D3D12FsrFrameGenerator::Impl {
         return S_OK;
     }
 
+    HRESULT select_color_domain(
+        std::span<const D3D12FsrEyeInput> inputs) noexcept {
+        DXGI_FORMAT selected = DXGI_FORMAT_UNKNOWN;
+        for (const auto& input : inputs) {
+            if (!input.color) return E_INVALIDARG;
+            const DXGI_FORMAT candidate =
+                linear_color_format(input.color->GetDesc().Format);
+            if (candidate == DXGI_FORMAT_UNKNOWN) return E_INVALIDARG;
+            if (selected == DXGI_FORMAT_UNKNOWN) {
+                selected = candidate;
+            } else if (selected != candidate) {
+                // One Texture2DArray cannot contain differently typed eyes.
+                return E_INVALIDARG;
+            }
+        }
+        if (selected == color_format) return S_OK;
+        for (auto& eye : eyes) destroy_eye(eye);
+        generated_array.Reset();
+        generated_array_state = D3D12_RESOURCE_STATE_COMMON;
+        color_format = selected;
+        return S_OK;
+    }
+
     HRESULT copy_inputs(ID3D12GraphicsCommandList* commands,
                         Eye& eye,
                         const D3D12FsrEyeInput& input) noexcept {
@@ -405,32 +417,12 @@ struct D3D12FsrFrameGenerator::Impl {
         if (configure(&eye.context, &configure_description.header) !=
             FFX_API_RETURN_OK) return E_FAIL;
 
-        const Vec3 up = rotate(input.camera_pose.orientation, {0.0F, 1.0F, 0.0F});
-        const Vec3 right = rotate(input.camera_pose.orientation, {1.0F, 0.0F, 0.0F});
-        const Vec3 forward = rotate(input.camera_pose.orientation, {0.0F, 0.0F, -1.0F});
-        ffxDispatchDescFrameGenerationPrepareCameraInfo camera{};
-        camera.header.type =
-            FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO;
-        camera.cameraPosition[0] = input.camera_pose.position.x;
-        camera.cameraPosition[1] = input.camera_pose.position.y;
-        camera.cameraPosition[2] = input.camera_pose.position.z;
-        camera.cameraUp[0] = up.x;
-        camera.cameraUp[1] = up.y;
-        camera.cameraUp[2] = up.z;
-        camera.cameraRight[0] = right.x;
-        camera.cameraRight[1] = right.y;
-        camera.cameraRight[2] = right.z;
-        camera.cameraForward[0] = forward.x;
-        camera.cameraForward[1] = forward.y;
-        camera.cameraForward[2] = forward.z;
-
         ffxCreateBackendDX12Desc backend{};
         backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
         backend.device = device.Get();
-        camera.header.pNext = &backend.header;
         ffxDispatchDescFrameGenerationPrepare prepare{};
         prepare.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
-        prepare.header.pNext = &camera.header;
+        prepare.header.pNext = &backend.header;
         prepare.commandList = commands;
         prepare.frameID = frame_id;
         prepare.renderSize = {eye.render_width, eye.render_height};
@@ -510,6 +502,13 @@ HRESULT D3D12FsrFrameGenerator::dispatch(
         report_fsr_frame_generation_attempt(false);
         return result;
     }
+    result = impl_->select_color_domain(inputs);
+    if (FAILED(result)) {
+        report_fsr_frame_generation_status(
+            FsrFrameGenerationStatus::waiting_for_guides);
+        report_fsr_frame_generation_attempt(false);
+        return result;
+    }
     result = impl_->ensure_array();
     if (FAILED(result)) {
         report_fsr_frame_generation_status(
@@ -523,6 +522,7 @@ HRESULT D3D12FsrFrameGenerator::dispatch(
         commands->ResourceBarrier(1, &barrier);
         impl_->generated_array_state = D3D12_RESOURCE_STATE_COPY_DEST;
     }
+    std::uint32_t used_output_slices = 0;
     for (std::size_t eye_index = 0; eye_index < inputs.size(); ++eye_index) {
         const auto& input = inputs[eye_index];
         if (!input.color || !input.depth || !input.motion_vectors ||
@@ -534,20 +534,45 @@ HRESULT D3D12FsrFrameGenerator::dispatch(
             report_fsr_frame_generation_attempt(false);
             return E_INVALIDARG;
         }
-        result = impl_->generate_eye(commands, impl_->eyes[eye_index], input);
+        const auto generated_description = impl_->generated_array->GetDesc();
+        if (static_cast<std::uint64_t>(input.color_rect.offset_x) +
+                    input.color_rect.width > generated_description.Width ||
+            static_cast<std::uint64_t>(input.color_rect.offset_y) +
+                    input.color_rect.height > generated_description.Height ||
+            input.output_slice >= generated_description.DepthOrArraySize ||
+            input.output_slice >= kMaximumEyes) {
+            report_fsr_frame_generation_status(
+                FsrFrameGenerationStatus::waiting_for_guides);
+            report_fsr_frame_generation_attempt(false);
+            return E_INVALIDARG;
+        }
+        const std::uint32_t output_slice_bit = 1U << input.output_slice;
+        if ((used_output_slices & output_slice_bit) != 0U) {
+            report_fsr_frame_generation_status(
+                FsrFrameGenerationStatus::waiting_for_guides);
+            report_fsr_frame_generation_attempt(false);
+            return E_INVALIDARG;
+        }
+        used_output_slices |= output_slice_bit;
+
+        // Temporal history belongs to the physical XR array slice, not to the
+        // transient position of that view in the submitted span. Keeping the
+        // context indexed by eye_index can feed the other eye's history when
+        // view order and array-slice order diverge across a route transition.
+        auto& eye = impl_->eyes[input.output_slice];
+        result = impl_->generate_eye(commands, eye, input);
         if (FAILED(result)) {
             report_fsr_frame_generation_status(
                 FsrFrameGenerationStatus::dispatch_failed);
             report_fsr_frame_generation_attempt(false);
             return result;
         }
-        auto& eye = impl_->eyes[eye_index];
         const auto before = transition(eye.output.Get(), eye.output_state,
                                        D3D12_RESOURCE_STATE_COPY_SOURCE);
         commands->ResourceBarrier(1, &before);
         copy_region(commands, impl_->generated_array.Get(),
                     input.color_rect.offset_x, input.color_rect.offset_y,
-                    input.color_slice, eye.output.Get(), 0,
+                    input.output_slice, eye.output.Get(), 0,
                     {0, 0, input.color_rect.width, input.color_rect.height});
         const auto after = transition(eye.output.Get(),
                                       D3D12_RESOURCE_STATE_COPY_SOURCE,

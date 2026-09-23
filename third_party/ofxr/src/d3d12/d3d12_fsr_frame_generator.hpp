@@ -13,6 +13,7 @@ namespace xrfg {
 struct D3D12FsrEyeInput {
     ID3D12Resource* color{};
     std::uint32_t color_slice{};
+    std::uint32_t output_slice{};
     D3D12ImageRect color_rect{};
     ID3D12Resource* depth{};
     D3D12ImageRect depth_rect{};

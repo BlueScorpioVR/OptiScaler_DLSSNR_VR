@@ -44,6 +44,12 @@ struct D3D12ReprojectionView {
         std::numeric_limits<std::uint32_t>::max()};
 };
 
+struct D3D12PresentationTransform {
+    bool active{};
+    std::uint32_t view_count{};
+    std::array<std::array<float, 16>, 2> clip_positions{};
+};
+
 struct D3D12FrameSynthesisTicket {
     std::uint64_t previous_serial{};
     std::uint64_t current_serial{};
@@ -140,7 +146,8 @@ public:
         std::span<const D3D12ReprojectionView> current_source_views,
         std::uint32_t current_destination_index,
         D3D12FrameSynthesisTicket* ticket,
-        std::shared_ptr<const DlssMotionVectorSet> motion_vectors = {}) noexcept;
+        std::shared_ptr<const DlssMotionVectorSet> motion_vectors = {},
+        D3D12PresentationTransform presentation_transform = {}) noexcept;
 
     [[nodiscard]] HRESULT submit_pair(
         const D3D12HistoryCaptureTicket& current,
@@ -150,7 +157,8 @@ public:
         std::uint32_t current_destination_index,
         D3D12FrameSynthesisTicket* ticket,
         std::optional<OverlayPlacement> debug_marker = std::nullopt,
-        std::shared_ptr<const DlssMotionVectorSet> motion_vectors = {}) noexcept;
+        std::shared_ptr<const DlssMotionVectorSet> motion_vectors = {},
+        D3D12PresentationTransform presentation_transform = {}) noexcept;
 
     // Relinquishes the retained rolling source against its last GPU-use fence.
     // This is nonblocking and is required before history invalidation.

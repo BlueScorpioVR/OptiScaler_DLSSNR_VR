@@ -11,6 +11,10 @@
 #include <nvOpticalFlowD3D12.h>
 
 #include "fullscreen_vertex_shader.hpp"
+#include "fsr_cinema_pixel_shader.hpp"
+#include "fsr_cinema_vertex_shader.hpp"
+#include "cinema_flatten_vertex_shader.hpp"
+#include "cinema_flatten_pixel_shader.hpp"
 #include "nvidia_bidirectional_synthesize_midpoint_pixel_shader.hpp"
 #include "nvidia_fast_synthesize_midpoint_pixel_shader.hpp"
 #include "nvidia_fast_bidirectional_synthesize_midpoint_pixel_shader.hpp"
@@ -22,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -75,6 +80,27 @@ constexpr float kCameraTolerance = 1.0e-5F;
 constexpr D3D12_RESOURCE_STATES kShaderReadState =
     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+[[nodiscard]] constexpr std::uint64_t pack_u32_pair(
+    std::uint32_t low,
+    std::uint32_t high) noexcept {
+    return static_cast<std::uint64_t>(low) |
+           (static_cast<std::uint64_t>(high) << 32U);
+}
+
+[[nodiscard]] std::uint64_t pack_float_pair(float low, float high) noexcept {
+    return pack_u32_pair(
+        std::bit_cast<std::uint32_t>(low),
+        std::bit_cast<std::uint32_t>(high));
+}
+
+[[nodiscard]] constexpr std::uint64_t pack_rect_16(
+    const D3D12ImageRect& rect) noexcept {
+    return (static_cast<std::uint64_t>(rect.offset_x) & 0xffffULL) |
+           ((static_cast<std::uint64_t>(rect.offset_y) & 0xffffULL) << 16U) |
+           ((static_cast<std::uint64_t>(rect.width) & 0xffffULL) << 32U) |
+           ((static_cast<std::uint64_t>(rect.height) & 0xffffULL) << 48U);
+}
 
 [[nodiscard]] bool same_device(
     ID3D12Device* expected,
@@ -139,6 +165,29 @@ constexpr D3D12_RESOURCE_STATES kShaderReadState =
                    resource_format == view_format;
         default:
             return false;
+    }
+}
+
+[[nodiscard]] DXGI_FORMAT linear_color_view_format(
+    DXGI_FORMAT resource_format,
+    DXGI_FORMAT fallback) noexcept {
+    switch (resource_format) {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    default:
+        return fallback;
     }
 }
 
@@ -269,6 +318,19 @@ struct SynthesisParameters {
     std::array<float, 2> game_motion_jitter_delta{};
     UINT game_motion_padding{};
 };
+
+struct FsrCinemaPanelParameters {
+    std::array<float, 16> clip_positions{};
+    std::array<float, 4> source_rect{};
+    UINT source_width{};
+    UINT source_height{};
+    UINT source_slice{};
+    UINT padding{};
+};
+
+constexpr UINT kFsrCinemaPanelConstantCount =
+    static_cast<UINT>(sizeof(FsrCinemaPanelParameters) / sizeof(UINT));
+static_assert(sizeof(FsrCinemaPanelParameters) == sizeof(UINT) * 24U);
 
 constexpr UINT kSynthesisConstantCount =
     static_cast<UINT>(sizeof(SynthesisParameters) / sizeof(UINT));
@@ -620,6 +682,7 @@ struct D3D12FrameSynthesizer::Impl {
         ComPtr<ID3D12CommandAllocator> timing_marker_allocator;
         ComPtr<ID3D12GraphicsCommandList> timing_marker_command_list;
         ComPtr<ID3D12DescriptorHeap> descriptor_heap;
+        ComPtr<ID3D12DescriptorHeap> cinema_source_heap;
         D3D12NvidiaGpuTiming timing_metadata{};
         D3D12NvidiaGpuTiming cached_timing{};
         std::uint64_t fence_value{};
@@ -637,6 +700,7 @@ struct D3D12FrameSynthesizer::Impl {
         UINT view_count{};
         std::uint64_t last_use_fence_value{};
         std::shared_ptr<const DlssMotionVectorSet> motion_vectors;
+        D3D12PresentationTransform presentation_transform{};
 
         [[nodiscard]] bool active() const noexcept {
             return lease.lease_serial != 0;
@@ -651,6 +715,7 @@ struct D3D12FrameSynthesizer::Impl {
             view_count = 0;
             last_use_fence_value = 0;
             motion_vectors.reset();
+            presentation_transform = {};
         }
     };
 
@@ -677,9 +742,14 @@ struct D3D12FrameSynthesizer::Impl {
     std::array<WorkSlot, kWorkSlotCount> work_slots;
     ComPtr<ID3D12DescriptorHeap> rtv_heap;
     ComPtr<ID3D12RootSignature> root_signature;
+    ComPtr<ID3D12RootSignature> fsr_cinema_root_signature;
     ComPtr<ID3D12PipelineState> pack_pipeline;
     ComPtr<ID3D12PipelineState> graphics_pipeline;
     ComPtr<ID3D12PipelineState> fsr_reprojection_pipeline;
+    ComPtr<ID3D12PipelineState> fsr_cinema_panel_pipeline;
+    ComPtr<ID3D12PipelineState> cinema_flatten_pipeline;
+    ComPtr<ID3D12Resource> cinema_flat_color;
+    ComPtr<ID3D12DescriptorHeap> cinema_flat_rtv_heap;
     ComPtr<ID3D12PipelineState> nvidia_pack_pipeline;
     ComPtr<ID3D12PipelineState> nvidia_graphics_pipeline;
     ComPtr<ID3D12PipelineState> nvidia_bidirectional_graphics_pipeline;
@@ -714,6 +784,7 @@ struct D3D12FrameSynthesizer::Impl {
     std::uint64_t last_submitted_fence_value{};
     std::uint64_t next_nvidia_fence_value{1};
     std::uint64_t last_nvidia_fence_value{};
+    std::uint64_t fsr_eye_diagnostic_pair{};
     std::uint64_t nvidia_timestamp_frequency{};
     std::uint32_t next_work_slot{};
     std::uint32_t next_timing_slot{};
@@ -833,6 +904,57 @@ struct D3D12FrameSynthesizer::Impl {
             return result;
         }
 
+        D3D12_DESCRIPTOR_RANGE cinema_range{};
+        cinema_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        cinema_range.NumDescriptors = 1;
+        cinema_range.BaseShaderRegister = 0;
+        cinema_range.OffsetInDescriptorsFromTableStart = 0;
+        std::array<D3D12_ROOT_PARAMETER, 2> cinema_parameters{};
+        cinema_parameters[0].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        cinema_parameters[0].DescriptorTable = {1, &cinema_range};
+        cinema_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        cinema_parameters[1].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        cinema_parameters[1].Constants.ShaderRegister = 0;
+        cinema_parameters[1].Constants.Num32BitValues =
+            kFsrCinemaPanelConstantCount;
+        cinema_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_STATIC_SAMPLER_DESC cinema_sampler{};
+        cinema_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        cinema_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        cinema_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        cinema_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        cinema_sampler.MaxAnisotropy = 1;
+        cinema_sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        cinema_sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+        cinema_sampler.MinLOD = 0.0F;
+        cinema_sampler.MaxLOD = D3D12_FLOAT32_MAX;
+        cinema_sampler.ShaderRegister = 0;
+        cinema_sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC cinema_root_description{};
+        cinema_root_description.NumParameters =
+            static_cast<UINT>(cinema_parameters.size());
+        cinema_root_description.pParameters = cinema_parameters.data();
+        cinema_root_description.NumStaticSamplers = 1;
+        cinema_root_description.pStaticSamplers = &cinema_sampler;
+        cinema_root_description.Flags =
+            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        serialized.Reset();
+        error.Reset();
+        result = D3D12SerializeRootSignature(
+            &cinema_root_description,
+            D3D_ROOT_SIGNATURE_VERSION_1,
+            serialized.GetAddressOf(),
+            error.GetAddressOf());
+        if (FAILED(result)) return result;
+        result = device->CreateRootSignature(
+            node_mask,
+            serialized->GetBufferPointer(),
+            serialized->GetBufferSize(),
+            IID_PPV_ARGS(fsr_cinema_root_signature.GetAddressOf()));
+        if (FAILED(result)) return result;
+
         D3D12_COMPUTE_PIPELINE_STATE_DESC compute_description{};
         compute_description.pRootSignature = root_signature.Get();
         compute_description.CS = {
@@ -928,6 +1050,37 @@ struct D3D12FrameSynthesizer::Impl {
         if (FAILED(result)) {
             return result;
         }
+
+        graphics_description.pRootSignature = fsr_cinema_root_signature.Get();
+        graphics_description.VS = {
+            g_xrfg_fsr_cinema_vertex_shader,
+            sizeof(g_xrfg_fsr_cinema_vertex_shader),
+        };
+        graphics_description.PS = {
+            g_xrfg_fsr_cinema_pixel_shader,
+            sizeof(g_xrfg_fsr_cinema_pixel_shader),
+        };
+        result = device->CreateGraphicsPipelineState(
+            &graphics_description,
+            IID_PPV_ARGS(fsr_cinema_panel_pipeline.GetAddressOf()));
+        if (FAILED(result)) return result;
+        // The pullback works on display-encoded UNORM values; no raw DLSS
+        // float colour or tone-map assumptions enter this pipeline.
+        graphics_description.pRootSignature = fsr_cinema_root_signature.Get();
+        graphics_description.VS = {g_xrfg_cinema_flatten_vertex_shader,
+                                  sizeof(g_xrfg_cinema_flatten_vertex_shader)};
+        graphics_description.PS = {g_xrfg_cinema_flatten_pixel_shader,
+                                  sizeof(g_xrfg_cinema_flatten_pixel_shader)};
+        graphics_description.RTVFormats[0] = linear_color_view_format(view_format, view_format);
+        result = device->CreateGraphicsPipelineState(&graphics_description,
+            IID_PPV_ARGS(cinema_flatten_pipeline.GetAddressOf()));
+        if (FAILED(result)) return result;
+        graphics_description.RTVFormats[0] = view_format;
+        graphics_description.pRootSignature = root_signature.Get();
+        graphics_description.VS = {
+            g_xrfg_fullscreen_vertex_shader,
+            sizeof(g_xrfg_fullscreen_vertex_shader),
+        };
 
         graphics_description.PS = {
             g_xrfg_nvidia_synthesize_midpoint_pixel_shader,
@@ -2178,9 +2331,9 @@ struct D3D12FrameSynthesizer::Impl {
     void create_source_views(
         WorkSlot& slot,
         ID3D12Resource* previous_resource,
-        ID3D12Resource* current_resource) noexcept {
+        ID3D12Resource* current_resource,
+        DXGI_FORMAT previous_view_format = DXGI_FORMAT_UNKNOWN) noexcept {
         D3D12_SHADER_RESOURCE_VIEW_DESC description{};
-        description.Format = view_format;
         description.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
         description.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         description.Texture2DArray.MostDetailedMip = 0;
@@ -2194,10 +2347,16 @@ struct D3D12FrameSynthesizer::Impl {
         const UINT block_count = image_description.DepthOrArraySize;
         for (UINT block = 0; block < block_count; ++block) {
             const UINT base = block * kDescriptorBlockSize;
+            // Ordinary A/B are OpenXR images. Preserve the negotiated sRGB
+            // decode even when their storage is typeless. Only raw FSR cinema
+            // colour has a separate view contract, supplied explicitly below.
+            description.Format = previous_view_format == DXGI_FORMAT_UNKNOWN
+                ? view_format : previous_view_format;
             device->CreateShaderResourceView(
                 previous_resource,
                 &description,
                 offset_cpu_handle(start, base, descriptor_increment));
+            description.Format = view_format;
             device->CreateShaderResourceView(
                 current_resource,
                 &description,
@@ -2451,6 +2610,100 @@ struct D3D12FrameSynthesizer::Impl {
         return S_OK;
     }
 
+    [[nodiscard]] HRESULT record_cinema_color(
+        WorkSlot& slot, const RollingSource& source,
+        std::span<const D3D12ReprojectionView> views) noexcept {
+        // One shared scratch array is safe: all writes and FSR reads are on
+        // the same synthesis queue, in submission order. It is never resized
+        // or destroyed independently of the synthesizer's existing lifetime.
+        const DXGI_FORMAT format = linear_color_view_format(view_format, view_format);
+        if (!cinema_flat_color) {
+            auto desc = image_description;
+            desc.Format = format;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            const auto properties = default_heap_properties(0);
+            HRESULT hr = device->CreateCommittedResource(&properties,
+                D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                nullptr, IID_PPV_ARGS(cinema_flat_color.GetAddressOf()));
+            if (FAILED(hr)) return hr;
+            cinema_flat_color->SetName(L"OFXR Cinema final-colour pullback");
+        }
+        if (!cinema_flat_rtv_heap) {
+            D3D12_DESCRIPTOR_HEAP_DESC heap{};
+            heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+            heap.NumDescriptors = image_description.DepthOrArraySize;
+            const HRESULT hr = device->CreateDescriptorHeap(&heap,
+                IID_PPV_ARGS(cinema_flat_rtv_heap.GetAddressOf()));
+            if (FAILED(hr)) return hr;
+            for (UINT slice = 0; slice < heap.NumDescriptors; ++slice) {
+                D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+                rtv.Format = format;
+                rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                rtv.Texture2DArray.FirstArraySlice = slice;
+                rtv.Texture2DArray.ArraySize = 1;
+                device->CreateRenderTargetView(cinema_flat_color.Get(), &rtv,
+                    offset_cpu_handle(cinema_flat_rtv_heap->GetCPUDescriptorHandleForHeapStart(), slice, rtv_increment));
+            }
+        }
+        if (!slot.cinema_source_heap) {
+            D3D12_DESCRIPTOR_HEAP_DESC heap{};
+            heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            heap.NumDescriptors = 1;
+            heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            const HRESULT hr = device->CreateDescriptorHeap(&heap,
+                IID_PPV_ARGS(slot.cinema_source_heap.GetAddressOf()));
+            if (FAILED(hr)) return hr;
+        }
+        // Validate every eye before recording the first transition.
+        for (UINT eye = 0; eye < views.size(); ++eye) {
+            const UINT slice = resolved_array_slice(views[eye], eye, views.size(), image_description.DepthOrArraySize);
+            if (slice >= source.motion_vectors->eye_count || !source.motion_vectors->eyes[slice]) return E_INVALIDARG;
+            const auto& guide = *source.motion_vectors->eyes[slice];
+            const D3D12ImageRect rect{guide.output_x, guide.output_y, guide.output_width, guide.output_height};
+            if (rect.width == 0 || rect.height == 0 ||
+                !rect_within_resource(rect, static_cast<UINT>(image_description.Width), image_description.Height)) return E_INVALIDARG;
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = view_format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2DArray.MipLevels = 1;
+        srv.Texture2DArray.ArraySize = image_description.DepthOrArraySize;
+        device->CreateShaderResourceView(source.resource.Get(), &srv,
+            slot.cinema_source_heap->GetCPUDescriptorHandleForHeapStart());
+        const std::array<D3D12_RESOURCE_BARRIER, 2> before{
+            transition_barrier(source.resource.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            transition_barrier(cinema_flat_color.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET)};
+        slot.command_list->ResourceBarrier(2, before.data());
+        ID3D12DescriptorHeap* heaps[]{slot.cinema_source_heap.Get()};
+        slot.command_list->SetDescriptorHeaps(1, heaps);
+        slot.command_list->SetGraphicsRootSignature(fsr_cinema_root_signature.Get());
+        slot.command_list->SetPipelineState(cinema_flatten_pipeline.Get());
+        slot.command_list->SetGraphicsRootDescriptorTable(0, slot.cinema_source_heap->GetGPUDescriptorHandleForHeapStart());
+        slot.command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        for (UINT eye = 0; eye < views.size(); ++eye) {
+            const UINT slice = resolved_array_slice(views[eye], eye, views.size(), image_description.DepthOrArraySize);
+            const auto& guide = *source.motion_vectors->eyes[slice];
+            const D3D12ImageRect rect{guide.output_x, guide.output_y, guide.output_width, guide.output_height};
+            const auto rtv = offset_cpu_handle(cinema_flat_rtv_heap->GetCPUDescriptorHandleForHeapStart(), slice, rtv_increment);
+            const float black[]{0, 0, 0, 1};
+            slot.command_list->ClearRenderTargetView(rtv, black, 0, nullptr);
+            slot.command_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            set_viewport_and_scissor(slot.command_list.Get(), rect,
+                static_cast<UINT>(image_description.Width), image_description.Height);
+            FsrCinemaPanelParameters parameters{};
+            parameters.clip_positions = source.presentation_transform.clip_positions[eye];
+            parameters.source_slice = slice;
+            slot.command_list->SetGraphicsRoot32BitConstants(1, kFsrCinemaPanelConstantCount, &parameters, 0);
+            slot.command_list->DrawInstanced(3, 1, 0, 0);
+        }
+        const std::array<D3D12_RESOURCE_BARRIER, 2> after{
+            transition_barrier(source.resource.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+            transition_barrier(cinema_flat_color.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON)};
+        slot.command_list->ResourceBarrier(2, after.data());
+        return S_OK;
+    }
+
     [[nodiscard]] HRESULT record_fsr_pair(
         WorkSlot& slot,
         const RollingSource& previous_source,
@@ -2470,9 +2723,25 @@ struct D3D12FrameSynthesizer::Impl {
                 FsrFrameGenerationStatus::waiting_for_guides);
             return DXGI_ERROR_WAS_STILL_DRAWING;
         }
+        const bool cinema_projection =
+            current_source.presentation_transform.active;
+        if (cinema_projection &&
+            (current_source.presentation_transform.view_count !=
+                 target_views.size() ||
+             fsr_cinema_root_signature == nullptr ||
+             fsr_cinema_panel_pipeline == nullptr)) {
+            return E_INVALIDARG;
+        }
 
         std::array<D3D12FsrEyeInput, kMaxReprojectionViews> inputs{};
+        if (cinema_projection) {
+            const HRESULT flatten_result = record_cinema_color(slot, current_source, target_views);
+            if (FAILED(flatten_result)) return flatten_result;
+        }
         std::array<D3D12ReprojectionView, kMaxReprojectionViews> midpoint_views{};
+        const bool log_fsr_eyes = cinema_projection &&
+            bridge_flight_logger().enabled() &&
+            ((fsr_eye_diagnostic_pair++ % 120U) == 0U);
         for (UINT view_index = 0; view_index < target_views.size(); ++view_index) {
             const UINT slice = resolved_array_slice(
                 target_views[view_index], view_index, target_views.size(),
@@ -2490,12 +2759,22 @@ struct D3D12FrameSynthesizer::Impl {
                     FsrFrameGenerationStatus::waiting_for_guides);
                 return DXGI_ERROR_WAS_STILL_DRAWING;
             }
-            const D3D12ImageRect color_rect = resolved_rect(
+            ID3D12Resource* color_resource = current_source.resource.Get();
+            UINT color_slice = slice;
+            D3D12ImageRect color_rect = resolved_rect(
                 current_source.views[view_index].image_rect,
                 static_cast<UINT>(image_description.Width),
                 image_description.Height);
+            if (cinema_projection) {
+                color_resource = cinema_flat_color.Get();
+                color_slice = slice;
+                color_rect = {
+                    guide.output_x, guide.output_y,
+                    guide.output_width, guide.output_height};
+            }
             inputs[view_index] = {
-                current_source.resource.Get(),
+                color_resource,
+                color_slice,
                 slice,
                 color_rect,
                 guide.depth.Get(),
@@ -2535,6 +2814,87 @@ struct D3D12FrameSynthesizer::Impl {
                 std::lerp(previous_source.views[view_index].fov.angle_down,
                           current_source.views[view_index].fov.angle_down, 0.5F),
             };
+
+            if (log_fsr_eyes) {
+                const auto color_description = color_resource->GetDesc();
+                const auto depth_description = guide.depth->GetDesc();
+                const auto motion_description = guide.motion_vectors->GetDesc();
+                const std::uint64_t slices_and_arrays =
+                    (static_cast<std::uint64_t>(slice) & 0xffULL) |
+                    ((static_cast<std::uint64_t>(color_slice) & 0xffULL) << 8U) |
+                    ((static_cast<std::uint64_t>(inputs[view_index].output_slice) & 0xffULL) << 16U) |
+                    ((static_cast<std::uint64_t>(guide.motion_slice) & 0xffULL) << 24U) |
+                    ((static_cast<std::uint64_t>(color_description.DepthOrArraySize) & 0xffULL) << 32U) |
+                    ((static_cast<std::uint64_t>(depth_description.DepthOrArraySize) & 0xffULL) << 40U) |
+                    ((static_cast<std::uint64_t>(motion_description.DepthOrArraySize) & 0xffULL) << 48U) |
+                    (static_cast<std::uint64_t>(guide.reset ? 1U : 0U) << 56U);
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_eye_binding,
+                    static_cast<std::int64_t>(view_index),
+                    guide.stream,
+                    guide.serial,
+                    slices_and_arrays);
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_eye_resources,
+                    static_cast<std::int64_t>(view_index),
+                    reinterpret_cast<std::uintptr_t>(color_resource),
+                    reinterpret_cast<std::uintptr_t>(guide.depth.Get()),
+                    reinterpret_cast<std::uintptr_t>(
+                        guide.motion_vectors.Get()));
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_eye_rects,
+                    static_cast<std::int64_t>(view_index),
+                    pack_rect_16(inputs[view_index].color_rect),
+                    pack_rect_16(inputs[view_index].depth_rect),
+                    pack_rect_16(inputs[view_index].motion_rect));
+                const std::uint32_t motion_flags =
+                    (guide.jittered ? 1U : 0U) |
+                    (guide.depth_inverted ? 2U : 0U) |
+                    (guide.depth_infinite ? 4U : 0U);
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_eye_motion,
+                    static_cast<std::int64_t>(view_index),
+                    pack_float_pair(guide.scale_x, guide.scale_y),
+                    pack_float_pair(guide.jitter_x, guide.jitter_y),
+                    pack_u32_pair(
+                        std::bit_cast<std::uint32_t>(guide.frame_time_delta_ms),
+                        motion_flags));
+                const Pose& pose = inputs[view_index].camera_pose;
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_eye_pose,
+                    static_cast<std::int64_t>(view_index),
+                    pack_float_pair(pose.position.x, pose.position.y),
+                    pack_float_pair(pose.position.z,
+                                    inputs[view_index].camera_fov_vertical),
+                    pack_float_pair(guide.camera_near, guide.camera_far));
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_eye_orientation,
+                    static_cast<std::int64_t>(view_index),
+                    pack_float_pair(pose.orientation.x, pose.orientation.y),
+                    pack_float_pair(pose.orientation.z, pose.orientation.w),
+                    guide.publication);
+                const D3D12FieldOfView& fov =
+                    current_source.views[view_index].fov;
+                bridge_flight_logger().event(
+                    BridgeFlightOperation::fsr_eye_fov,
+                    static_cast<std::int64_t>(view_index),
+                    pack_float_pair(fov.angle_left, fov.angle_right),
+                    pack_float_pair(fov.angle_up, fov.angle_down),
+                    pack_u32_pair(
+                        static_cast<std::uint32_t>(color_description.Format),
+                        static_cast<std::uint32_t>(motion_description.Format)));
+                const auto& clip = current_source.presentation_transform
+                                       .clip_positions[view_index];
+                for (std::uint32_t vertex = 0; vertex < 4U; ++vertex) {
+                    const std::size_t offset = vertex * 4U;
+                    bridge_flight_logger().event(
+                        BridgeFlightOperation::fsr_eye_clip_vertex,
+                        static_cast<std::int64_t>(view_index),
+                        pack_float_pair(clip[offset], clip[offset + 1U]),
+                        pack_float_pair(clip[offset + 2U], clip[offset + 3U]),
+                        vertex);
+                }
+            }
         }
 
         if (backend == D3D12OpticalFlowBackend::nvidia) {
@@ -2552,15 +2912,24 @@ struct D3D12FrameSynthesizer::Impl {
         ID3D12Resource* const current_resource = current_source.resource.Get();
         ID3D12Resource* const current_destination =
             current_destinations[current_destination_index].resource.Get();
-        create_source_views(slot, generated, current_resource);
+        create_source_views(slot, generated, current_resource,
+            cinema_projection
+                ? linear_color_view_format(generated->GetDesc().Format, view_format)
+                : view_format);
         const auto current_to_read = transition_barrier(
             current_resource, D3D12_RESOURCE_STATE_COMMON, kShaderReadState);
         slot.command_list->ResourceBarrier(1, &current_to_read);
 
         ID3D12DescriptorHeap* heaps[] = {slot.descriptor_heap.Get()};
         slot.command_list->SetDescriptorHeaps(1, heaps);
-        slot.command_list->SetGraphicsRootSignature(root_signature.Get());
-        slot.command_list->SetPipelineState(fsr_reprojection_pipeline.Get());
+        slot.command_list->SetGraphicsRootSignature(
+            cinema_projection
+                ? fsr_cinema_root_signature.Get()
+                : root_signature.Get());
+        slot.command_list->SetPipelineState(
+            cinema_projection
+                ? fsr_cinema_panel_pipeline.Get()
+                : fsr_reprojection_pipeline.Get());
         slot.command_list->IASetPrimitiveTopology(
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         const auto gpu_start =
@@ -2587,22 +2956,53 @@ struct D3D12FrameSynthesizer::Impl {
             slot.command_list->SetGraphicsRootDescriptorTable(
                 0, offset_gpu_handle(gpu_start, descriptor_base,
                                      descriptor_increment));
-            slot.command_list->SetGraphicsRootDescriptorTable(
-                1, offset_gpu_handle(gpu_start,
-                    descriptor_base + kSrvDescriptorCount,
-                    descriptor_increment));
-            parameters.slice = slice;
-            parameters.view_index = view_index;
-            slot.command_list->SetGraphicsRoot32BitConstants(
-                2, kSynthesisConstantCount, &parameters, 0);
+            if (cinema_projection) {
+                const auto generated_description = generated->GetDesc();
+                FsrCinemaPanelParameters cinema_parameters{};
+                cinema_parameters.clip_positions =
+                    current_source.presentation_transform
+                        .clip_positions[view_index];
+                cinema_parameters.source_rect = {
+                    static_cast<float>(inputs[view_index].color_rect.offset_x),
+                    static_cast<float>(inputs[view_index].color_rect.offset_y),
+                    static_cast<float>(inputs[view_index].color_rect.width),
+                    static_cast<float>(inputs[view_index].color_rect.height)};
+                cinema_parameters.source_width =
+                    static_cast<UINT>(generated_description.Width);
+                cinema_parameters.source_height = generated_description.Height;
+                cinema_parameters.source_slice = inputs[view_index].output_slice;
+                slot.command_list->SetGraphicsRoot32BitConstants(
+                    1, kFsrCinemaPanelConstantCount,
+                    &cinema_parameters, 0);
+            } else {
+                slot.command_list->SetGraphicsRootDescriptorTable(
+                    1, offset_gpu_handle(gpu_start,
+                        descriptor_base + kSrvDescriptorCount,
+                        descriptor_increment));
+                parameters.slice = slice;
+                parameters.view_index = view_index;
+                slot.command_list->SetGraphicsRoot32BitConstants(
+                    2, kSynthesisConstantCount, &parameters, 0);
+            }
             const auto rtv = offset_cpu_handle(
                 rtv_start, first_rtv + slice, rtv_increment);
             slot.command_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-            set_viewport_and_scissor(
-                slot.command_list.Get(), target_views[view_index].image_rect,
-                static_cast<UINT>(image_description.Width),
-                image_description.Height);
-            slot.command_list->DrawInstanced(3, 1, 0, 0);
+            if (cinema_projection) {
+                const float black[4]{0.0F, 0.0F, 0.0F, 1.0F};
+                slot.command_list->ClearRenderTargetView(
+                    rtv, black, 0, nullptr);
+                set_viewport_and_scissor(
+                    slot.command_list.Get(), {},
+                    static_cast<UINT>(image_description.Width),
+                    image_description.Height);
+                slot.command_list->DrawInstanced(6, 1, 0, 0);
+            } else {
+                set_viewport_and_scissor(
+                    slot.command_list.Get(), target_views[view_index].image_rect,
+                    static_cast<UINT>(image_description.Width),
+                    image_description.Height);
+                slot.command_list->DrawInstanced(3, 1, 0, 0);
+            }
             clear_synthetic_marker(
                 slot.command_list.Get(), rtv, target_views[view_index],
                 static_cast<UINT>(image_description.Width),
@@ -3732,7 +4132,8 @@ struct D3D12FrameSynthesizer::Impl {
         std::span<const D3D12ReprojectionView> current_source_views,
         std::uint32_t current_destination_index,
         D3D12FrameSynthesisTicket* output_ticket,
-        std::shared_ptr<const DlssMotionVectorSet> motion_vectors) noexcept {
+        std::shared_ptr<const DlssMotionVectorSet> motion_vectors,
+        D3D12PresentationTransform presentation_transform) noexcept {
         if (output_ticket == nullptr) {
             return E_POINTER;
         }
@@ -3764,6 +4165,7 @@ struct D3D12FrameSynthesizer::Impl {
             return result;
         }
         next.motion_vectors = std::move(motion_vectors);
+        next.presentation_transform = std::move(presentation_transform);
         const auto cancel_next = [this, &next]() noexcept {
             history->cancel_consumer(next.lease);
             next.clear();
@@ -3827,7 +4229,8 @@ struct D3D12FrameSynthesizer::Impl {
         std::uint32_t current_destination_index,
         D3D12FrameSynthesisTicket* output_ticket,
         const std::optional<OverlayPlacement>& debug_marker,
-        std::shared_ptr<const DlssMotionVectorSet> motion_vectors) noexcept {
+        std::shared_ptr<const DlssMotionVectorSet> motion_vectors,
+        D3D12PresentationTransform presentation_transform) noexcept {
         if (output_ticket == nullptr) {
             return E_POINTER;
         }
@@ -3983,6 +4386,7 @@ struct D3D12FrameSynthesizer::Impl {
             return result;
         }
         next.motion_vectors = std::move(motion_vectors);
+        next.presentation_transform = std::move(presentation_transform);
         const auto cancel_next = [this, &next]() noexcept {
             history->cancel_consumer(next.lease);
             next.clear();
@@ -4232,7 +4636,8 @@ HRESULT D3D12FrameSynthesizer::submit_prime(
     std::span<const D3D12ReprojectionView> current_source_views,
     std::uint32_t current_destination_index,
     D3D12FrameSynthesisTicket* ticket,
-    std::shared_ptr<const DlssMotionVectorSet> motion_vectors) noexcept {
+    std::shared_ptr<const DlssMotionVectorSet> motion_vectors,
+    D3D12PresentationTransform presentation_transform) noexcept {
     try {
         std::scoped_lock lock(mutex_);
         if (impl_ == nullptr) {
@@ -4246,7 +4651,8 @@ HRESULT D3D12FrameSynthesizer::submit_prime(
             current_source_views,
             current_destination_index,
             ticket,
-            std::move(motion_vectors));
+            std::move(motion_vectors),
+            std::move(presentation_transform));
     } catch (...) {
         if (ticket != nullptr) {
             *ticket = {};
@@ -4263,7 +4669,8 @@ HRESULT D3D12FrameSynthesizer::submit_pair(
     std::uint32_t current_destination_index,
     D3D12FrameSynthesisTicket* ticket,
     std::optional<OverlayPlacement> debug_marker,
-    std::shared_ptr<const DlssMotionVectorSet> motion_vectors) noexcept {
+    std::shared_ptr<const DlssMotionVectorSet> motion_vectors,
+    D3D12PresentationTransform presentation_transform) noexcept {
     try {
         std::scoped_lock lock(mutex_);
         if (impl_ == nullptr) {
@@ -4280,7 +4687,8 @@ HRESULT D3D12FrameSynthesizer::submit_pair(
             current_destination_index,
             ticket,
             debug_marker,
-            std::move(motion_vectors));
+            std::move(motion_vectors),
+            std::move(presentation_transform));
     } catch (...) {
         if (ticket != nullptr) {
             *ticket = {};

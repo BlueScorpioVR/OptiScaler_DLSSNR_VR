@@ -185,7 +185,7 @@ bool DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* InCmdList, const DlssNrCon
     }
 
     wchar_t marker[128] {};
-    swprintf_s(marker, L"OptiScaler V23080 DLSS-NR shader mode=%u immutable-binding=%zu",
+    swprintf_s(marker, L"OptiScaler V23216 DLSS-NR shader mode=%u immutable-binding=%zu",
                InConstants.Mode, bindingIndex);
     DredMarkers::Set(InCmdList, marker);
     LOG_DEBUG("V23070 NR shader mode {} immutable binding {} cmd {:p} src {:p} model {:p} original {:p} motion {:p} out {:p}",

@@ -582,6 +582,8 @@ class ResTrack_Dx12
     }
 
   public:
+    // NVIDIA NR needs the game queue submission even when OptiScaler's FG/HUD tracking is off.
+    static void HookQueueSubmission(ID3D12Device* device);
     static void HookDevice(ID3D12Device* device);
     static void ReleaseHooks();
     static void ReleaseDeviceHooks();
