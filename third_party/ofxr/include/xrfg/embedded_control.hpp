@@ -26,6 +26,10 @@ void detach(std::uint64_t id);
 void applied(std::uint64_t id, std::uint64_t revision, bool enabled, long error);
 bool logging_setting();
 bool set_logging_setting(bool enabled); // next process: logger is initialized once
+bool cadence_setting();
+bool set_cadence_setting(bool enabled);
+bool marker_setting();
+bool set_marker_setting(bool enabled);
 int overlay_setting();
 bool set_overlay_setting(int position); // existing overlay polls its INI live
 }

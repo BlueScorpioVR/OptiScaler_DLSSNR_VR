@@ -87,6 +87,10 @@ void applied(std::uint64_t id, std::uint64_t revision, bool enabled, long error)
 }
 bool logging_setting() { return GetPrivateProfileIntW(L"diagnostics", L"logging_enabled", 0, ini().c_str()) != 0; }
 bool set_logging_setting(bool enabled) { return write(L"diagnostics", L"logging_enabled", enabled ? L"1" : L"0"); }
+bool cadence_setting() { return GetPrivateProfileIntW(L"diagnostics", L"cadence_logging_enabled", 0, ini().c_str()) != 0; }
+bool set_cadence_setting(bool enabled) { return write(L"diagnostics", L"cadence_logging_enabled", enabled ? L"1" : L"0"); }
+bool marker_setting() { return GetPrivateProfileIntW(L"diagnostics", L"synthetic_marker_enabled", logging_setting() || cadence_setting(), ini().c_str()) != 0; }
+bool set_marker_setting(bool enabled) { return write(L"diagnostics", L"synthetic_marker_enabled", enabled ? L"1" : L"0"); }
 int overlay_setting() {
     wchar_t value[32]{}; GetPrivateProfileStringW(L"overlay", L"position", L"upper_right", value, 32, ini().c_str());
     for (int i = 0; i < 5; ++i) if (_wcsicmp(value, positions[i]) == 0) return i;

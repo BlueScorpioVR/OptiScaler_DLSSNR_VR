@@ -291,6 +291,10 @@ bool logging_setting() noexcept {
     return complete(api) ? api.get_logging() != 0
                          : xrfg::embedded::logging_setting();
 }
+bool cadence_setting() noexcept { return xrfg::embedded::cadence_setting(); }
+bool set_cadence_setting(bool enabled) noexcept { return xrfg::embedded::set_cadence_setting(enabled); }
+bool marker_setting() noexcept { return xrfg::embedded::marker_setting(); }
+bool set_marker_setting(bool enabled) noexcept { return xrfg::embedded::set_marker_setting(enabled); }
 bool set_logging_setting(bool enabled) noexcept {
     const auto api = current_dispatch();
     return complete(api) ? api.set_logging(enabled ? 1 : 0) != 0

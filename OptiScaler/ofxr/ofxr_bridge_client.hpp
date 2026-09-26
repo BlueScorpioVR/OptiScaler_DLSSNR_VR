@@ -13,6 +13,10 @@ namespace ofxr_bridge {
 
 [[nodiscard]] bool logging_setting() noexcept;
 [[nodiscard]] bool set_logging_setting(bool enabled) noexcept;
+[[nodiscard]] bool cadence_setting() noexcept;
+[[nodiscard]] bool set_cadence_setting(bool enabled) noexcept;
+[[nodiscard]] bool marker_setting() noexcept;
+[[nodiscard]] bool set_marker_setting(bool enabled) noexcept;
 [[nodiscard]] int overlay_setting() noexcept;
 [[nodiscard]] bool set_overlay_setting(int position) noexcept;
 

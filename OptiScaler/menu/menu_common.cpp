@@ -7004,6 +7004,13 @@ static void RenderOfxrVrFramegenMenu()
     bool logging = ofxr_bridge::logging_setting();
     if (ImGui::Checkbox("OFXR logging (next game start)", &logging))
         (void) ofxr_bridge::set_logging_setting(logging);
+    bool cadence = ofxr_bridge::cadence_setting();
+    if (ImGui::Checkbox("FSR cadence probe (RAM, next game start)", &cadence))
+        (void) ofxr_bridge::set_cadence_setting(cadence);
+    bool marker = ofxr_bridge::marker_setting();
+    if (ImGui::Checkbox("Synthetic marker (next game start)", &marker))
+        (void) ofxr_bridge::set_marker_setting(marker);
+    if (cadence) ImGui::TextDisabled("Cadence log is saved when the XR session closes.");
     ImGui::PopID();
 }
 

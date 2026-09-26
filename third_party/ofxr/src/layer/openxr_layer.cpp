@@ -5,6 +5,7 @@
 #include "xrfg/dlss_motion_vectors.hpp"
 #include "xrfg/d3d11_d3d12_interop.hpp"
 #include "xrfg/bridge_flight_logger.hpp"
+#include "xrfg/fsr_cadence_probe.hpp"
 #include "xrfg/luke_render_identity.hpp"
 #include "xrfg/generation_backpressure.hpp"
 #include "xrfg/implicit_layer.hpp"
@@ -267,7 +268,8 @@ enum class GenerationQuarantineReason : std::int64_t {
 
 struct SessionState {
     explicit SessionState(std::shared_ptr<Dispatch> next_dispatch)
-        : dispatch(std::move(next_dispatch)), manual_control(current_layer_directory()) {}
+        : dispatch(std::move(next_dispatch)), manual_control(current_layer_directory()),
+          fsr_cadence(current_layer_directory()) {}
 
     ~SessionState() {
         xrfg::embedded::detach(control_id);
@@ -281,6 +283,7 @@ struct SessionState {
 
     std::shared_ptr<Dispatch> dispatch;
     xrfg::implicit_layer::ManualArmControl manual_control;
+    xrfg::FsrCadenceProbe fsr_cadence;
     std::uint64_t control_id{xrfg::embedded::attach()};
     std::uint64_t control_revision{}; // frame_call_mutex
     bool control_reconfigure_required{};
@@ -6264,7 +6267,7 @@ struct PreparedProjectionFrame {
             synthetic_image.acquired_index;
 
         xrfg::D3D12FrameSynthesisTicket ticket{};
-        const auto debug_marker = request_pair && xrfg::bridge_flight_logger().enabled() &&
+        const auto debug_marker = request_pair && state->session->fsr_cadence.marker_enabled(xrfg::bridge_flight_logger().enabled()) &&
                 state->session->fps_overlay
             ? state->session->fps_overlay->marker_placement()
             : std::nullopt;
@@ -7077,6 +7080,7 @@ struct InternalCycleResult {
     XrResult result{XR_SUCCESS};
     std::chrono::steady_clock::duration wait_elapsed{};
     XrDuration predicted_display_period{};
+    XrTime display_time{};
     bool completed{};
 };
 
@@ -7102,6 +7106,7 @@ struct InternalCycleResult {
         &frame_state);
     output.wait_elapsed = std::chrono::steady_clock::now() - wait_started;
     output.predicted_display_period = frame_state.predictedDisplayPeriod;
+    output.display_time = frame_state.predictedDisplayTime;
     xrfg::bridge_flight_logger().end(
         wait_token,
         xrfg::BridgeFlightOperation::internal_wait_frame,
@@ -7658,6 +7663,8 @@ XrResult layer_end_frame_impl(
         };
     const auto bypass_generation =
         [&](GenerationPrepareReason reason) -> XrResult {
+            if (state->frame_generation_mode == xrfg::D3D12FrameGenerationMode::fsr3)
+                state->fsr_cadence.bypass(static_cast<std::int64_t>(reason));
             update_luke_application_clock(*state, false, false);
             // A borrowed frame advances source capture serials without advancing
             // synthesis history. Retire the old anchor BEFORE draining/taking
@@ -8064,6 +8071,9 @@ XrResult layer_end_frame_impl(
             : 0,
         submitted_end_info ? submitted_end_info->layerCount : 0);
     const auto first_end_started = std::chrono::steady_clock::now();
+    if (pair_ready && state->frame_generation_mode == xrfg::D3D12FrameGenerationMode::fsr3)
+        state->fsr_cadence.generated(state->fps_overlay &&
+            state->fsr_cadence.marker_enabled(xrfg::bridge_flight_logger().enabled()));
     XrResult result = XR_SUCCESS;
     if (use_continuous_presenter) {
         if (pair_ready) {
@@ -8271,6 +8281,13 @@ XrResult layer_end_frame_impl(
     // pair: from the synthetic's hand-over completing to the real frame's.
     const auto inline_pair_gap = std::chrono::steady_clock::now() -
         (first_end_started + first_end_elapsed);
+    if (state->frame_generation_mode == xrfg::D3D12FrameGenerationMode::fsr3) {
+        const auto ns = [](auto value) { return static_cast<std::uint64_t>((std::max)(
+            std::int64_t{0}, std::chrono::duration_cast<std::chrono::nanoseconds>(value).count())); };
+        state->fsr_cadence.pair(current_cycle.completed, ns(inline_pair_gap),
+            static_cast<std::uint64_t>((std::max)(XrDuration{0}, current_cycle.predicted_display_period)),
+            ns(current_cycle.wait_elapsed), current_cycle.display_time - first_generated.info.displayTime);
+    }
     if (!current_cycle.completed) {
         // The synthetic submission has already completed. A transient runtime
         // failure in the optional second cycle is recovered by the established
