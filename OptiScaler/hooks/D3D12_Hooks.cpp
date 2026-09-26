@@ -68,6 +68,7 @@ static LUID _lastAdapterLuid = {};
 // alter command ordering.
 static void EnableDredDiagnosticsOnce()
 {
+    if (!Config::Instance()->LogToFile.value_or_default()) return;
     static std::once_flag once;
     std::call_once(once, []
     {

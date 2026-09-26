@@ -12,6 +12,9 @@
 
 namespace NrFlightTrace
 {
+inline std::atomic<bool> enabled {false};
+inline bool Enabled() noexcept { return enabled.load(std::memory_order_relaxed); }
+inline void SetEnabled(bool value) noexcept { enabled.store(value, std::memory_order_relaxed); }
 struct Record
 {
     unsigned long long sequence = 0;
@@ -62,6 +65,7 @@ inline void Write(const char* kind, ID3D12GraphicsCommandList* commandList, cons
                   D3D12_RESOURCE_STATES before = D3D12_RESOURCE_STATE_COMMON,
                   D3D12_RESOURCE_STATES after = D3D12_RESOURCE_STATE_COMMON, long long result = 0)
 {
+    if (!Enabled()) return;
     State& state = GetState();
     Record record {};
     record.sequence = state.sequence.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -82,6 +86,7 @@ inline void Write(const char* kind, ID3D12GraphicsCommandList* commandList, cons
 template <typename Sink>
 inline void Dump(Sink&& sink)
 {
+    if (!Enabled()) return;
     State& state = GetState();
     std::lock_guard<std::mutex> lock(state.mutex);
     const unsigned long long end = state.sequence.load(std::memory_order_acquire);

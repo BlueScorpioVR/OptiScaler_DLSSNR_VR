@@ -171,6 +171,7 @@ class Monitor
     }
     void Report()
     {
+        if (!NrFlightTrace::Enabled()) return;
         const HRESULT reason = device_->GetDeviceRemovedReason();
         SYSTEMTIME now {}; GetSystemTime(&now);
         file_.Line("device_removed utc=%02u:%02u:%02u.%03u tid=%lu reason=0x%08X fence=%llu",
@@ -244,6 +245,7 @@ class Monitor
 
     static std::shared_ptr<Monitor> Observe(IUnknown* owner, const std::filesystem::path& directory)
     {
+        if (!NrFlightTrace::Enabled()) return {};
         if (!owner) return {};
         ComPtr<ID3D12Device> device;
         if (FAILED(owner->QueryInterface(IID_PPV_ARGS(&device))))

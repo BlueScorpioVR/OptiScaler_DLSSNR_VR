@@ -174,6 +174,7 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
+        NrFlightTrace::SetEnabled(true);
         EnableDred();
         if (argc == 3 && std::wstring(argv[1]) == L"--child")
         {
@@ -187,6 +188,18 @@ int wmain(int argc, wchar_t** argv)
         const auto root = std::filesystem::absolute("build/dred-tests-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()));
         std::filesystem::create_directories(root / "lifetime");
         std::filesystem::create_directories(root / "child");
+        {
+            auto device = Warp();
+            NrFlightTrace::SetEnabled(false);
+            Check(!Monitor::Observe(device.Get(), root / "disabled"), "logging off does not arm observer");
+            Check(!std::filesystem::exists(root / "disabled"), "logging off creates no diagnostic directory");
+            const auto sequence = NrFlightTrace::GetState().sequence.load();
+            NrFlightTrace::Marker(nullptr, L"disabled");
+            Check(NrFlightTrace::GetState().sequence.load() == sequence, "logging off records no NR event");
+            NrFlightTrace::SetEnabled(true);
+            NrFlightTrace::Marker(nullptr, L"enabled");
+            Check(NrFlightTrace::GetState().sequence.load() == sequence + 1, "logging on retains NR event");
+        }
         TestWriter(root);
         TestLifetime(root / "lifetime");
         TestTermination(root / "child");

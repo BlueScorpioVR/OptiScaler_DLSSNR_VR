@@ -342,9 +342,11 @@ void MarkNrRecorded(unsigned int sourceHandleId, ID3D12GraphicsCommandList* comm
     flight.awaitingSubmission = true;
     flight.recordedList = commandList;
     flight.recording = g_nrSubmissionLedger.Record(sourceHandleId, commandList).recording;
-    wchar_t label[160] {};
-    swprintf_s(label, L"NR_RECORD handle=%u recording=%llu", sourceHandleId, flight.recording);
-    NrFlightTrace::Write("NR_RECORD", commandList, label);
+    if (NrFlightTrace::Enabled()) {
+        wchar_t label[160] {};
+        swprintf_s(label, L"NR_RECORD handle=%u recording=%llu", sourceHandleId, flight.recording);
+        NrFlightTrace::Write("NR_RECORD", commandList, label);
+    }
 }
 
 struct NrRetirementObservation
@@ -406,10 +408,12 @@ bool RetirePreviousNrEvaluate(unsigned int sourceHandleId)
     }
 
     const auto completed = fence == nullptr ? 0 : fence->GetCompletedValue();
-    wchar_t retirementLabel[200] {};
-    swprintf_s(retirementLabel, L"NR_REUSE handle=%u fence=%p required=%llu completed=%llu",
-               sourceHandleId, fence.Get(), fenceValue, completed);
-    NrFlightTrace::Write("NR_REUSE", nullptr, retirementLabel);
+    if (NrFlightTrace::Enabled()) {
+        wchar_t retirementLabel[200] {};
+        swprintf_s(retirementLabel, L"NR_REUSE handle=%u fence=%p required=%llu completed=%llu",
+                   sourceHandleId, fence.Get(), fenceValue, completed);
+        NrFlightTrace::Write("NR_REUSE", nullptr, retirementLabel);
+    }
     if (completed == UINT64_MAX)
         return false;
     if (fence == nullptr || fenceValue == 0 || DlssNr::NrFenceRetired(completed, fenceValue))
@@ -484,6 +488,7 @@ unsigned long long g_captureWriteAtFrame = 0;
 // be asked for one from outside the game -- no alt-tab, no menu. Checked once a second, effectively.
 void CheckCaptureTrigger()
 {
+    if (!NrFlightTrace::Enabled()) return;
     if ((g_frames % 60) != 0)
         return;
 
@@ -1017,6 +1022,7 @@ std::vector<NrSubmissionReceipt> TakeCommandListSubmissionReceipts(
     }
     for (const auto& receipt : receipts)
     {
+        if (!NrFlightTrace::Enabled()) break;
         wchar_t label[160] {};
         swprintf_s(label, L"NR_DETACH handle=%u recording=%llu", receipt.handle, receipt.recording);
         NrFlightTrace::Write("NR_DETACH", static_cast<ID3D12GraphicsCommandList*>(receipt.list), label);
@@ -1068,11 +1074,13 @@ void CompleteCommandListSubmission(ID3D12CommandQueue* queue,
         found->second.recordedList = nullptr;
         found->second.fence = queueFence.fence;
         found->second.fenceValue = fenceValue;
-        wchar_t label[220] {};
-        swprintf_s(label, L"NR_SUBMIT handle=%u recording=%llu queue=%p fence=%p value=%llu completed=%llu",
-                   receipt.handle, receipt.recording, queue, queueFence.fence.Get(), fenceValue,
-                   queueFence.fence->GetCompletedValue());
-        NrFlightTrace::Write("NR_SUBMIT", static_cast<ID3D12GraphicsCommandList*>(receipt.list), label);
+        if (NrFlightTrace::Enabled()) {
+            wchar_t label[220] {};
+            swprintf_s(label, L"NR_SUBMIT handle=%u recording=%llu queue=%p fence=%p value=%llu completed=%llu",
+                       receipt.handle, receipt.recording, queue, queueFence.fence.Get(), fenceValue,
+                       queueFence.fence->GetCompletedValue());
+            NrFlightTrace::Write("NR_SUBMIT", static_cast<ID3D12GraphicsCommandList*>(receipt.list), label);
+        }
     }
 }
 
@@ -1562,11 +1570,13 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
 
     int result = 0;
     {
+        if (NrFlightTrace::Enabled()) {
         wchar_t modelReceipt[256] {};
         swprintf_s(modelReceipt, L"NR_MODEL handle=%u feature=%p params=%p color=%p depth=%p motion=%p output=%p reset=%u source=%u",
                    sourceHandleId, nr.feature, evaluateParams, modelInput, depthIn, motionIn, nr.output,
                    nr.reset ? 1u : 0u, nr.sourceReset ? 1u : 0u);
         NrFlightTrace::Write("NR_MODEL", cmdList, modelReceipt);
+        }
         DredScope stage(cmdList, L"OptiScaler V23216 DLSS-NR pre-SR model");
         result = g_runtime.evaluate(
             cmdList, nr.feature, evaluateParams, modelInput, depthIn, motionIn, nr.output,
@@ -2186,11 +2196,13 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
 
     int result = 0;
     {
+        if (NrFlightTrace::Enabled()) {
         wchar_t modelReceipt[256] {};
         swprintf_s(modelReceipt, L"NR_MODEL handle=%u feature=%p params=%p color=%p depth=%p motion=%p output=%p reset=%u source=%u",
                    sourceHandleId, nr.feature, evaluateParams, modelInput, depthIn, motionIn, nr.output,
                    nr.reset ? 1u : 0u, nr.sourceReset ? 1u : 0u);
         NrFlightTrace::Write("NR_MODEL", cmdList, modelReceipt);
+        }
         DredScope stage(cmdList, L"OptiScaler V23216 DLSS-NR post-SR model");
         result = g_runtime.evaluate(
             cmdList, nr.feature, evaluateParams, modelInput, depthIn, motionIn, nr.output,
@@ -2343,6 +2355,7 @@ std::optional<double> LastGpuTime() { return std::nullopt; }
 
 void RequestCapture(unsigned int frames)
 {
+    if (!NrFlightTrace::Enabled()) return;
     ClearCaptureDirectory();
     g_capture.request(frames);
 }

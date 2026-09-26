@@ -72,11 +72,11 @@ GetWitcherHudlessColor witcher_hudless_color_export() noexcept {
     return function;
 }
 
-// One short, crash-surviving admission record every 120 FSR pairs. The full
-// bridge recorder can remain disabled during the visual/lifetime trial.
+// Optional admission record; ordinary gameplay performs no file I/O here.
 void log_post_hud_admission(bool ready, std::int64_t display_time,
                             DXGI_FORMAT scene_format,
                             DXGI_FORMAT final_format) noexcept {
+    if (!bridge_flight_logger().enabled()) return;
     static std::atomic<std::uint64_t> pair_count{};
     const auto pair = pair_count.fetch_add(1, std::memory_order_relaxed);
     if (pair % 120U != 0U) return;

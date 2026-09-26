@@ -337,7 +337,7 @@ class Config
     //
     // Writes one set of matched before/after frames per session, without anyone having to ask. The
     // folder is cleared at the start of each run, so it holds one session's worth and never grows.
-    CustomOptional<bool> DlssNrAutoCapture { true };
+    CustomOptional<bool> DlssNrAutoCapture { false };
 
 
 

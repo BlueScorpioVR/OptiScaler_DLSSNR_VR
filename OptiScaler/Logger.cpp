@@ -7,9 +7,11 @@
 #include "spdlog/sinks/basic_file_sink.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/sinks/callback_sink.h"
+#include "spdlog/sinks/null_sink.h"
 #include <include/spdlog_sink/debug_sink.h>
 
 #include "Util.h"
+#include "diagnostics/NrFlightTrace.h"
 
 static bool InitializeConsole()
 {
@@ -67,6 +69,9 @@ void WaitForEnter()
 
 void PrepareLogger()
 {
+    // NR RAM tracing, DRED markers and its independent file observer follow the
+    // file-logging switch. No recorder allocation/work during ordinary gameplay.
+    NrFlightTrace::SetEnabled(Config::Instance()->LogToFile.value_or_default());
     try
     {
         if (spdlog::default_logger() != nullptr)
@@ -163,6 +168,13 @@ void PrepareLogger()
             shared_logger->flush_on(spdlog::level::trace);
 
             spdlog::set_default_logger(shared_logger);
+        }
+        else
+        {
+            auto sink = std::make_shared<spdlog::sinks::null_sink_mt>();
+            auto logger = std::make_shared<spdlog::logger>("logging_off", sink);
+            logger->set_level(spdlog::level::off);
+            spdlog::set_default_logger(logger);
         }
     }
     catch (const spdlog::spdlog_ex& ex)

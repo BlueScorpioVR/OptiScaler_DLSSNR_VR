@@ -19,7 +19,7 @@ inline UINT ByteSize(const wchar_t* text)
 
 inline void Set(ID3D12GraphicsCommandList* commandList, const wchar_t* text)
 {
-    if (commandList != nullptr && text != nullptr)
+    if (NrFlightTrace::Enabled() && commandList != nullptr && text != nullptr)
     {
         NrFlightTrace::Marker(commandList, text);
         commandList->SetMarker(kUnicodeMetadata, text, ByteSize(text));
@@ -28,7 +28,7 @@ inline void Set(ID3D12GraphicsCommandList* commandList, const wchar_t* text)
 
 inline void Begin(ID3D12GraphicsCommandList* commandList, const wchar_t* text)
 {
-    if (commandList != nullptr && text != nullptr)
+    if (NrFlightTrace::Enabled() && commandList != nullptr && text != nullptr)
     {
         NrFlightTrace::StageBegin(commandList, text);
         commandList->BeginEvent(kUnicodeMetadata, text, ByteSize(text));
@@ -37,7 +37,7 @@ inline void Begin(ID3D12GraphicsCommandList* commandList, const wchar_t* text)
 
 inline void End(ID3D12GraphicsCommandList* commandList, const wchar_t* text)
 {
-    if (commandList != nullptr)
+    if (NrFlightTrace::Enabled() && commandList != nullptr)
     {
         commandList->EndEvent();
         NrFlightTrace::StageEnd(commandList, text);
@@ -48,7 +48,7 @@ inline void BeforeBarrier(ID3D12GraphicsCommandList* commandList, const wchar_t*
                           ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
                           D3D12_RESOURCE_STATES after)
 {
-    if (commandList == nullptr)
+    if (!NrFlightTrace::Enabled() || commandList == nullptr)
         return;
 
     wchar_t marker[256] {};
