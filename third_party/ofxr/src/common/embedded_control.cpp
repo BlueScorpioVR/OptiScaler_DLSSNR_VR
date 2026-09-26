@@ -25,6 +25,9 @@ struct Control {
     Control() {
         const auto options = implicit_layer::read_nvidia_options(directory());
         settings.backend = static_cast<int>(implicit_layer::read_flow_backend(directory()));
+        wchar_t route[16]{};
+        GetPrivateProfileStringW(L"ofxr", L"nvidia_route", L"legacy", route, 16, ini().c_str());
+        if (settings.backend == 1 && _wcsicmp(route, L"new") == 0) settings.backend = 2;
         settings.preset = static_cast<int>(options.preset);
         settings.scale = static_cast<int>(options.input_scale);
         settings.backward = options.bidirectional;
@@ -56,7 +59,7 @@ Snapshot snapshot() {
     return s;
 }
 bool request(Settings s) {
-    if (s.backend < 0 || s.backend > 1 || s.preset < 0 || s.preset > 2 ||
+    if (s.backend < 0 || s.backend > 2 || s.preset < 0 || s.preset > 2 ||
         s.scale < 0 || s.scale > 2 || s.motion_vectors < 0 || s.motion_vectors > 1 ||
         s.frame_generation < 0 || s.frame_generation > 1) return false;
     auto& c = control(); std::scoped_lock lock(c.mutex);
@@ -65,6 +68,7 @@ bool request(Settings s) {
     // Do not rewrite diagnostics, comments, or unrelated configuration.
     if (old.enabled != s.enabled) ok &= write(L"ofxr", L"enabled", s.enabled ? L"1" : L"0");
     if (old.backend != s.backend) ok &= write(L"ofxr", L"backend", s.backend ? L"nvidia" : L"fidelityfx");
+    if (old.backend != s.backend) ok &= write(L"ofxr", L"nvidia_route", s.backend == 2 ? L"new" : L"legacy");
     const wchar_t* presets[]{L"slow", L"medium", L"fast"};
     const wchar_t* scales[]{L"100", L"75", L"50"};
     if (old.preset != s.preset) ok &= write(L"ofxr", L"nvidia_preset", presets[s.preset]);

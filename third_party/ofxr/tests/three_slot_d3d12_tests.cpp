@@ -221,6 +221,7 @@ int main(int argc,char** argv) {
         auto dispatch=std::make_shared<Dispatch>(); session_state=std::make_shared<SessionState>(dispatch);
         auto& s=session_state;s->handle=reinterpret_cast<XrSession>(0x211);s->graphics_binding=SessionGraphicsBinding::d3d12;
         s->optical_flow_backend=xrfg::D3D12OpticalFlowBackend::nvidia;
+        s->nvidia_new_route = true;
         fsr_test=argc>1 && std::string_view(argv[1]).starts_with("fsr-inline");
         fsr_missing=argc>1 && std::string_view(argv[1])=="fsr-inline-wait";
         if(fsr_test) {

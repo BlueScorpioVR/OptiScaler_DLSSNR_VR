@@ -6928,19 +6928,19 @@ static void RenderOfxrVrFramegenMenu()
     int engine = settings.enabled == 0
         ? 0
         : settings.frame_generation == 1
-            ? 3
-            : settings.backend == 1 ? 2 : 1;
+            ? 4
+            : settings.backend == 2 ? 3 : settings.backend == 1 ? 2 : 1;
     bool changed = ImGui::Combo(
-        "Engine", &engine, "Off\0FidelityFX\0NVIDIA\0FSR 3.1\0");
+        "Engine", &engine, "Off\0FidelityFX\0Nvidia\0Nvidia (new)\0FSR 3.1\0");
     if (changed)
     {
         settings.enabled = engine == 0 ? 0 : 1;
-        settings.frame_generation = engine == 3 ? 1 : 0;
-        settings.backend = engine == 2 ? 1 : 0;
-        settings.motion_vectors = engine == 3 ? 1 : 0;
+        settings.frame_generation = engine == 4 ? 1 : 0;
+        settings.backend = engine == 3 ? 2 : engine == 2 ? 1 : 0;
+        settings.motion_vectors = engine == 4 ? 1 : 0;
     }
 
-    if (engine == 2)
+    if (engine == 2 || engine == 3)
     {
         int uiPreset = settings.preset == 2 ? 0 : settings.preset == 1 ? 1 : 2;
         if (ImGui::Combo("NVIDIA preset", &uiPreset, "Fast\0Medium\0Slow\0"))
@@ -6967,12 +6967,12 @@ static void RenderOfxrVrFramegenMenu()
     {
         ImGui::TextDisabled("Disabled");
     }
-    else if (engine == 3 && !ofxr_bridge::supports_fsr())
+    else if (engine == 4 && !ofxr_bridge::supports_fsr())
     {
         ImGui::TextColored(ImVec4(0.90F, 0.25F, 0.20F, 1.0F),
                            "FSR requires OFXR provider API v2");
     }
-    else if (engine == 3)
+    else if (engine == 4)
     {
         const auto guides = ofxr_bridge::dlss_guide_statistics();
         if (guides.fsr_used != 0)

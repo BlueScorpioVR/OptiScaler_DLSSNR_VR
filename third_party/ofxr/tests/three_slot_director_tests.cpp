@@ -116,6 +116,7 @@ std::shared_ptr<SessionState> session() {
     state->handle = reinterpret_cast<XrSession>(0x207);
     state->graphics_binding = SessionGraphicsBinding::d3d11;
     state->optical_flow_backend = xrfg::D3D12OpticalFlowBackend::nvidia;
+    state->nvidia_new_route = true;
     state->presenter_active = true;
     state->three_slot_director = true;
     state->presenter_frame_state_valid = true;
@@ -605,6 +606,16 @@ void luke_cycle_clock_test() {
 int main(int argc, char** argv) {
     auto state = session();
     try {
+        check(three_slot_generation_session(state), "Nvidia (new) must select director");
+        state->nvidia_new_route = false;
+        check(!three_slot_generation_session(state), "Nvidia legacy must exclude director");
+        state->nvidia_new_route = true;
+        state->frame_generation_mode = xrfg::D3D12FrameGenerationMode::fsr3;
+        check(!three_slot_generation_session(state), "FSR must remain inline");
+        state->frame_generation_mode = xrfg::D3D12FrameGenerationMode::ofxr;
+        state->optical_flow_backend = xrfg::D3D12OpticalFlowBackend::fidelity_fx;
+        check(!three_slot_generation_session(state), "FidelityFX must exclude NVIDIA director");
+        state->optical_flow_backend = xrfg::D3D12OpticalFlowBackend::nvidia;
         if (argc > 1) {
             const auto mode = std::string_view(argv[1]);
             if(mode == "luke-unit") { luke_admission_test(); return 0; }
@@ -621,6 +632,28 @@ int main(int argc, char** argv) {
             gpu_pipeline(mode == "composition" || mode == "transition" || mode == "capture", mode == "transition", mode == "capture"); return 0;
         }
         embedded_eligibility_test();
+        // Apply both menu revisions to the real session implementation. The
+        // GPU backend stays NVIDIA: only presenter ownership is switched.
+        {
+            auto selected = session();
+            selected->presenter_active = false;
+            const auto original = xrfg::embedded::snapshot().desired;
+            auto choice = original;
+            choice.backend = 1;
+            choice.frame_generation = 0;
+            check(xrfg::embedded::request(choice), "request Nvidia legacy");
+            apply_embedded_control(selected);
+            check(!three_slot_generation_session(selected), "legacy menu revision applied");
+            choice.backend = 2;
+            check(xrfg::embedded::request(choice), "request Nvidia new");
+            apply_embedded_control(selected);
+            check(three_slot_generation_session(selected), "new menu revision applied");
+            choice.backend = 1;
+            check(xrfg::embedded::request(choice), "request legacy again");
+            apply_embedded_control(selected);
+            check(!three_slot_generation_session(selected), "reverse menu revision applied");
+            check(xrfg::embedded::request(original), "restore test configuration");
+        }
         // Virtual WaitFrame must return even while synthesis is deliberately
         // marked busy and no director is running. No tick/fence gate survives.
         { std::scoped_lock lock(g_state_mutex); g_sessions[state->handle] = state; }

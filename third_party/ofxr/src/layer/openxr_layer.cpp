@@ -344,6 +344,7 @@ struct SessionState {
     xrfg::D3D12OpticalFlowBackend optical_flow_backend{
         xrfg::D3D12OpticalFlowBackend::fidelity_fx};
     xrfg::D3D12NvidiaOpticalFlowOptions nvidia_options{};
+    bool nvidia_new_route{};
     bool dlss_motion_vectors{};
     xrfg::D3D12FrameGenerationMode frame_generation_mode{};
     xrfg::D3D12PresentationTransform presentation_transform{};
@@ -2396,7 +2397,9 @@ XrResult layer_create_session_impl(
 
     auto state = std::make_shared<SessionState>(dispatch);
     const auto initial_control = xrfg::embedded::snapshot();
-    state->optical_flow_backend = static_cast<xrfg::D3D12OpticalFlowBackend>(initial_control.desired.backend);
+    state->optical_flow_backend = initial_control.desired.backend == 0
+        ? xrfg::D3D12OpticalFlowBackend::fidelity_fx : xrfg::D3D12OpticalFlowBackend::nvidia;
+    state->nvidia_new_route = initial_control.desired.backend == 2;
     state->nvidia_options = {
         static_cast<xrfg::D3D12NvidiaPerformancePreset>(initial_control.desired.preset),
         static_cast<xrfg::D3D12NvidiaInputScale>(initial_control.desired.scale),
@@ -5305,6 +5308,7 @@ void stop_continuous_presenter(
     return state->frame_generation_mode !=
                xrfg::D3D12FrameGenerationMode::fsr3 &&
            state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
+           state->nvidia_new_route &&
            (state->graphics_binding == SessionGraphicsBinding::d3d11 ||
             state->graphics_binding == SessionGraphicsBinding::d3d12) &&
            !state->pipelined_presenter_mode;
@@ -7353,7 +7357,9 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
     for (const auto& chain : swapchains) capture_locks.emplace_back(chain->call_mutex);
     std::scoped_lock gpu_lock(state->gpu_mutex);
     HRESULT result = S_OK;
-    const auto backend = static_cast<xrfg::D3D12OpticalFlowBackend>(control.desired.backend);
+    const auto backend = control.desired.backend == 0
+        ? xrfg::D3D12OpticalFlowBackend::fidelity_fx : xrfg::D3D12OpticalFlowBackend::nvidia;
+    const bool nvidia_new_route = control.desired.backend == 2;
     const auto generation_mode = static_cast<xrfg::D3D12FrameGenerationMode>(control.desired.frame_generation);
     const xrfg::D3D12NvidiaOpticalFlowOptions options{
         static_cast<xrfg::D3D12NvidiaPerformancePreset>(control.desired.preset),
@@ -7362,12 +7368,14 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
         options.preset != state->nvidia_options.preset ||
         options.input_scale != state->nvidia_options.input_scale ||
         options.bidirectional != state->nvidia_options.bidirectional ||
-        generation_mode != state->frame_generation_mode;
+        generation_mode != state->frame_generation_mode ||
+        nvidia_new_route != state->nvidia_new_route;
     // Enumeration is excluded by frame_call_mutex, so newly created contexts
     // also see this tuple. A partial failure remains bypass, never mixed flow.
     state->optical_flow_backend = backend;
     state->nvidia_options = options;
     state->frame_generation_mode = generation_mode;
+    state->nvidia_new_route = nvidia_new_route;
     state->dlss_motion_vectors = control.desired.motion_vectors == 1 ||
         generation_mode == xrfg::D3D12FrameGenerationMode::fsr3;
     for (const auto& chain : swapchains) {
@@ -7445,7 +7453,8 @@ void apply_embedded_control(const std::shared_ptr<SessionState>& state) {
     if (state->fps_overlay) state->fps_overlay->reset_metrics();
     xrfg::embedded::applied(state->control_id, control.revision, state->menu_enabled, result);
     xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::embedded_configuration,
-        result, control.revision, optical_flow_configuration_code(backend, options), state->menu_enabled ? 1 : 0);
+        result, control.revision, optical_flow_configuration_code(backend, options),
+        (state->menu_enabled ? 1ULL : 0ULL) | (state->nvidia_new_route ? 2ULL : 0ULL));
 }
 
 // Correlate source-release fingerprints with submitted eye metadata, even
