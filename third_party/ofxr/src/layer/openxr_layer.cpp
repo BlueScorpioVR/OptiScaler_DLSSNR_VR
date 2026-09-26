@@ -5829,6 +5829,7 @@ build_reprojection_views(
             snapshot.layers[reference.projection_index]
                 .views[reference.view_index];
         xrfg::D3D12ReprojectionView& destination = output[view_index];
+        destination.display_time = snapshot.display_time;
         destination.pose.orientation = {
             source.pose.orientation.x,
             source.pose.orientation.y,

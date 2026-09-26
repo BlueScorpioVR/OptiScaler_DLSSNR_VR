@@ -28,6 +28,7 @@ constexpr std::uint64_t kMegabyte = 1024ull * 1024ull;
     BridgeFlightOperation operation) noexcept {
     switch (operation) {
     case BridgeFlightOperation::fsr_eye_binding: return "fsr_eye_binding";
+    case BridgeFlightOperation::fsr_hudless_pair: return "fsr_hudless_pair";
     case BridgeFlightOperation::fsr_eye_resources: return "fsr_eye_resources";
     case BridgeFlightOperation::fsr_eye_rects: return "fsr_eye_rects";
     case BridgeFlightOperation::fsr_eye_motion: return "fsr_eye_motion";

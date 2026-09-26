@@ -42,6 +42,7 @@ struct D3D12ReprojectionView {
     // per array slice is supplied in slice order.
     std::uint32_t array_slice{
         std::numeric_limits<std::uint32_t>::max()};
+    std::int64_t display_time{};
 };
 
 struct D3D12PresentationTransform {

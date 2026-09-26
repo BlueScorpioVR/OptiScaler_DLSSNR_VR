@@ -129,6 +129,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     set(XRFG_FULLSCREEN_VERTEX_HEADER "${XRFG_GENERATED_SHADER_DIR}/fullscreen_vertex_shader.hpp")
     set(XRFG_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/synthesize_midpoint_pixel_shader.hpp")
     set(XRFG_REPROJECT_GENERATED_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/reproject_generated_pixel_shader.hpp")
+    set(XRFG_REPROJECT_LATE_HUD_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/reproject_late_hud_pixel_shader.hpp")
     set(XRFG_FSR_CINEMA_VERTEX_HEADER "${XRFG_GENERATED_SHADER_DIR}/fsr_cinema_vertex_shader.hpp")
     set(XRFG_FSR_CINEMA_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/fsr_cinema_pixel_shader.hpp")
     set(XRFG_CINEMA_FLATTEN_VERTEX_HEADER "${XRFG_GENERATED_SHADER_DIR}/cinema_flatten_vertex_shader.hpp")
@@ -145,6 +146,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             "${XRFG_FULLSCREEN_VERTEX_HEADER}"
             "${XRFG_SYNTHESIZE_PIXEL_HEADER}"
             "${XRFG_REPROJECT_GENERATED_PIXEL_HEADER}"
+            "${XRFG_REPROJECT_LATE_HUD_PIXEL_HEADER}"
             "${XRFG_FSR_CINEMA_VERTEX_HEADER}"
             "${XRFG_FSR_CINEMA_PIXEL_HEADER}"
             "${XRFG_CINEMA_FLATTEN_VERTEX_HEADER}"
@@ -174,6 +176,10 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E ReprojectGeneratedPS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_REPROJECT_GENERATED_PIXEL_HEADER}" /Vn g_xrfg_reproject_generated_pixel_shader
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
+        COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E ReprojectGeneratedWithLateHudPS
+            /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
+            /Fh "${XRFG_REPROJECT_LATE_HUD_PIXEL_HEADER}" /Vn g_xrfg_reproject_late_hud_pixel_shader
             "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T vs_5_1 /E CinemaPanelVS
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
@@ -228,6 +234,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         "${XRFG_FULLSCREEN_VERTEX_HEADER}"
         "${XRFG_SYNTHESIZE_PIXEL_HEADER}"
         "${XRFG_REPROJECT_GENERATED_PIXEL_HEADER}"
+        "${XRFG_REPROJECT_LATE_HUD_PIXEL_HEADER}"
         "${XRFG_FSR_CINEMA_VERTEX_HEADER}"
         "${XRFG_FSR_CINEMA_PIXEL_HEADER}"
         "${XRFG_NVIDIA_PACK_INPUT_HEADER}"
@@ -498,6 +505,10 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         add_test(NAME xrfg_ram_timing_d3d12 COMMAND xrfg_three_slot_d3d12_tests ram)
         add_test(NAME xrfg_three_slot_d3d12_array COMMAND xrfg_three_slot_d3d12_tests array)
         add_test(NAME xrfg_fsr_inline_missing_guides COMMAND xrfg_three_slot_d3d12_tests fsr-inline-wait)
+        add_test(NAME xrfg_fsr_post_hud_contract
+            COMMAND "${CMAKE_COMMAND}"
+                "-DXRFG_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/fsr_post_hud_contract.cmake")
         if(EXISTS "${XRFG_FIDELITYFX_SDK_ROOT}/../PrebuiltSignedDLL/amd_fidelityfx_dx12.dll")
             add_custom_command(TARGET xrfg_three_slot_d3d12_tests POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different

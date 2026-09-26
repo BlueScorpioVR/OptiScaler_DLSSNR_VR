@@ -5,6 +5,7 @@ Texture2D<uint> FlowAuxiliary : register(t3);
 Texture2D<int2> ForwardFlow : register(t4);
 Texture2D<uint> ForwardAuxiliary : register(t5);
 Texture2DArray<float2> GameMotionVectors : register(t6);
+Texture2DArray<float4> SceneOnlyFrame : register(t7);
 RWTexture2D<float4> PackedColor : register(u0);
 RWTexture2D<float4> NvidiaPreviousColor : register(u1);
 RWTexture2D<float4> NvidiaCurrentColor : register(u2);
@@ -823,4 +824,23 @@ float4 ReprojectGeneratedPS(FullscreenVertex input) : SV_Target {
         return saturate(generated.color);
     }
     return saturate(sample_current_target(pixel, Slice, ViewIndex).color);
+}
+
+// FSR receives the scene-only image. The displayed native HUD is restored
+// here, after FSR dispatch and camera reprojection, from the exact same-frame
+// final-minus-scene colour difference. No HUD pixels enter FSR optical flow or
+// its temporal history. Both sources are sampled in the XR linear-light view.
+float4 ReprojectGeneratedWithLateHudPS(FullscreenVertex input) : SV_Target {
+    uint2 integer_pixel = uint2(input.position.xy);
+    if (integer_pixel.x >= Width || integer_pixel.y >= Height ||
+        Slice >= ArraySize) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    const float2 pixel = float2(integer_pixel);
+    CameraSample generated = sample_previous_target(pixel, Slice, ViewIndex);
+    float4 scene = SceneOnlyFrame.Load(int4(integer_pixel, Slice, 0));
+    float4 final_color = CurrentFrame.Load(int4(integer_pixel, Slice, 0));
+    float3 base_color = generated.valid >= 0.5
+        ? generated.color.rgb : scene.rgb;
+    return float4(saturate(base_color + final_color.rgb - scene.rgb), 1.0);
 }

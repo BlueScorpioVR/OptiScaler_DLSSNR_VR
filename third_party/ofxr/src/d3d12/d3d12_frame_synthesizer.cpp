@@ -23,16 +23,22 @@
 #include "nvidia_synthesize_midpoint_pixel_shader.hpp"
 #include "pack_flow_input_shader.hpp"
 #include "reproject_generated_pixel_shader.hpp"
+#include "reproject_late_hud_pixel_shader.hpp"
 #include "game_motion_synthesize_midpoint_pixel_shader.hpp"
 #include "synthesize_midpoint_pixel_shader.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <cwchar>
 #include <limits>
+#include <mutex>
 #include <new>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -40,6 +46,75 @@ namespace xrfg {
 namespace {
 
 using Microsoft::WRL::ComPtr;
+using GetWitcherHudlessColor = int (*)(
+    std::int64_t, ID3D12Resource**) noexcept;
+
+GetWitcherHudlessColor witcher_hudless_color_export() noexcept {
+    static std::atomic<GetWitcherHudlessColor> cached{};
+    if (auto* const found = cached.load(std::memory_order_acquire))
+        return found;
+    std::array<wchar_t, 32768> executable_path{};
+    const DWORD count = GetModuleFileNameW(
+        nullptr, executable_path.data(),
+        static_cast<DWORD>(executable_path.size()));
+    if (count == 0 || count >= executable_path.size()) return nullptr;
+    wchar_t* const slash = std::wcsrchr(
+        executable_path.data(), L'\\');
+    if (slash == nullptr) return nullptr;
+    std::wstring module_path(executable_path.data(), slash + 1);
+    module_path += L"dxgi.dll";
+    const HMODULE module = GetModuleHandleW(module_path.c_str());
+    if (module == nullptr) return nullptr;
+    auto* const function = reinterpret_cast<GetWitcherHudlessColor>(
+        GetProcAddress(module, "W3VR_GetHudlessXrColorV1"));
+    if (function != nullptr)
+        cached.store(function, std::memory_order_release);
+    return function;
+}
+
+// One short, crash-surviving admission record every 120 FSR pairs. The full
+// bridge recorder can remain disabled during the visual/lifetime trial.
+void log_post_hud_admission(bool ready, std::int64_t display_time,
+                            DXGI_FORMAT scene_format,
+                            DXGI_FORMAT final_format) noexcept {
+    static std::atomic<std::uint64_t> pair_count{};
+    const auto pair = pair_count.fetch_add(1, std::memory_order_relaxed);
+    if (pair % 120U != 0U) return;
+    static HANDLE file = []() noexcept {
+        std::array<wchar_t, 32768> path{};
+        const DWORD length = GetModuleFileNameW(
+            nullptr, path.data(), static_cast<DWORD>(path.size()));
+        if (length == 0 || length >= path.size()) return INVALID_HANDLE_VALUE;
+        wchar_t* slash = std::wcsrchr(path.data(), L'\\');
+        if (slash == nullptr) return INVALID_HANDLE_VALUE;
+        *++slash = L'\0';
+        constexpr wchar_t name[] = L"ofxr-fsr-post-hud-V23224.log";
+        if (static_cast<std::size_t>(slash - path.data()) +
+                std::size(name) > path.size()) return INVALID_HANDLE_VALUE;
+        if (wcscpy_s(slash, path.size() -
+                static_cast<std::size_t>(slash - path.data()), name) != 0)
+            return INVALID_HANDLE_VALUE;
+        return CreateFileW(path.data(), GENERIC_WRITE, FILE_SHARE_READ,
+                           nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                           nullptr);
+    }();
+    if (file == INVALID_HANDLE_VALUE) return;
+    char line[192]{};
+    const int size = std::snprintf(line, sizeof(line),
+        "pid=%lu tick=%llu pair=%llu post_hud=%u time=%lld scene_format=%u final_format=%u\r\n",
+        static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long long>(GetTickCount64()),
+        static_cast<unsigned long long>(pair), ready ? 1U : 0U,
+        static_cast<long long>(display_time),
+        static_cast<unsigned>(scene_format),
+        static_cast<unsigned>(final_format));
+    if (size <= 0 || size >= sizeof(line)) return;
+    static std::mutex file_mutex;
+    std::scoped_lock lock{file_mutex};
+    DWORD written{};
+    static_cast<void>(WriteFile(file, line, static_cast<DWORD>(size),
+                                &written, nullptr));
+}
 void dred_marker(ID3D12GraphicsCommandList* command_list, const char* label) noexcept {
     if (command_list != nullptr && label != nullptr &&
         bridge_flight_logger().enabled()) {
@@ -71,7 +146,7 @@ struct NvidiaInputScaleRatio {
     }
 }
 constexpr UINT kMaxReprojectionViews = 2;
-constexpr UINT kSrvDescriptorCount = 7;
+constexpr UINT kSrvDescriptorCount = 8;
 constexpr UINT kUavDescriptorCount = 3;
 constexpr UINT kDescriptorBlockSize =
     kSrvDescriptorCount + kUavDescriptorCount;
@@ -739,6 +814,9 @@ struct D3D12FrameSynthesizer::Impl {
         ComPtr<ID3D12GraphicsCommandList> timing_marker_command_list;
         ComPtr<ID3D12DescriptorHeap> descriptor_heap;
         ComPtr<ID3D12DescriptorHeap> cinema_source_heap;
+        // Keeps the Witcher scene-only XR image alive until this GPU slot's
+        // recorded FSR copy has retired.
+        ComPtr<ID3D12Resource> hudless_source;
         std::array<NvidiaEyeResources, kMaxReprojectionViews> nvidia_eyes;
         D3D12NvidiaGpuTiming timing_metadata{};
         D3D12NvidiaGpuTiming cached_timing{};
@@ -792,6 +870,7 @@ struct D3D12FrameSynthesizer::Impl {
     ComPtr<ID3D12PipelineState> graphics_pipeline;
     ComPtr<ID3D12PipelineState> game_motion_graphics_pipeline;
     ComPtr<ID3D12PipelineState> fsr_reprojection_pipeline;
+    ComPtr<ID3D12PipelineState> fsr_post_hud_pipeline;
     ComPtr<ID3D12PipelineState> fsr_cinema_panel_pipeline;
     ComPtr<ID3D12PipelineState> cinema_flatten_pipeline;
     ComPtr<ID3D12Resource> cinema_flat_color;
@@ -856,6 +935,7 @@ struct D3D12FrameSynthesizer::Impl {
     std::uint64_t next_nvidia_fence_value{1};
     std::uint64_t last_nvidia_fence_value{};
     std::uint64_t fsr_eye_diagnostic_pair{};
+    std::uint64_t fsr_hudless_diagnostic_pair{};
     std::uint64_t nvidia_timestamp_frequency{};
     std::uint32_t next_work_slot{};
     std::uint32_t next_timing_slot{};
@@ -1156,6 +1236,14 @@ struct D3D12FrameSynthesizer::Impl {
         if (FAILED(result)) {
             return result;
         }
+        graphics_description.PS = {
+            g_xrfg_reproject_late_hud_pixel_shader,
+            sizeof(g_xrfg_reproject_late_hud_pixel_shader),
+        };
+        result = device->CreateGraphicsPipelineState(
+            &graphics_description,
+            IID_PPV_ARGS(fsr_post_hud_pipeline.GetAddressOf()));
+        if (FAILED(result)) return result;
 
         graphics_description.pRootSignature = fsr_cinema_root_signature.Get();
         graphics_description.VS = {
@@ -3114,6 +3202,41 @@ struct D3D12FrameSynthesizer::Impl {
             return E_INVALIDARG;
         }
 
+        // The V1571 Witcher renderer snapshots this exact XR colour before
+        // its late HUD draw. The normal VR image and snapshot share format,
+        // extent, eye slices and transfer domain. Cinema requires its own
+        // panel-space pullback and deliberately stays on the prior FSR path.
+        slot.hudless_source.Reset();
+        bool hudless_pair_ready = false;
+        const auto display_time = current_source.views[0].display_time;
+        if (!cinema_projection && display_time != 0) {
+            if (auto* const get_hudless = witcher_hudless_color_export()) {
+                ID3D12Resource* borrowed{};
+                if (get_hudless(display_time, &borrowed) != 0 &&
+                    borrowed != nullptr) {
+                    slot.hudless_source.Attach(borrowed);
+                    const auto hudless_description = borrowed->GetDesc();
+                    hudless_pair_ready = same_device(device.Get(), borrowed) &&
+                        hudless_description.Dimension ==
+                            D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                        hudless_description.Width == image_description.Width &&
+                        hudless_description.Height == image_description.Height &&
+                        hudless_description.DepthOrArraySize ==
+                            image_description.DepthOrArraySize &&
+                        linear_color_view_format(
+                            hudless_description.Format, DXGI_FORMAT_UNKNOWN) ==
+                            linear_color_view_format(
+                                image_description.Format, DXGI_FORMAT_UNKNOWN);
+                }
+            }
+        }
+        if (hudless_pair_ready) {
+            for (UINT view_index = 0; view_index < target_views.size(); ++view_index) {
+                if (current_source.views[view_index].display_time != display_time)
+                    hudless_pair_ready = false;
+            }
+        }
+
         std::array<D3D12FsrEyeInput, kMaxReprojectionViews> inputs{};
         if (cinema_projection) {
             const HRESULT flatten_result = record_cinema_color(slot, current_source, target_views);
@@ -3140,7 +3263,11 @@ struct D3D12FrameSynthesizer::Impl {
                     FsrFrameGenerationStatus::waiting_for_guides);
                 return DXGI_ERROR_WAS_STILL_DRAWING;
             }
-            ID3D12Resource* color_resource = current_source.resource.Get();
+            // FSR's colour/optical-flow/temporal input is scene only. The
+            // final HUD-containing image is read solely by the later output
+            // compositor, after FSR has finished its synthesis.
+            ID3D12Resource* color_resource = hudless_pair_ready
+                ? slot.hudless_source.Get() : current_source.resource.Get();
             UINT color_slice = slice;
             D3D12ImageRect color_rect = resolved_rect(
                 current_source.views[view_index].image_rect,
@@ -3278,6 +3405,27 @@ struct D3D12FrameSynthesizer::Impl {
             }
         }
 
+        if (!hudless_pair_ready) {
+            slot.hudless_source.Reset();
+        }
+        log_post_hud_admission(
+            hudless_pair_ready, display_time,
+            slot.hudless_source ? slot.hudless_source->GetDesc().Format
+                                : DXGI_FORMAT_UNKNOWN,
+            image_description.Format);
+        if (bridge_flight_logger().enabled() &&
+            ((fsr_hudless_diagnostic_pair++ % 120U) == 0U)) {
+            bridge_flight_logger().event(
+                BridgeFlightOperation::fsr_hudless_pair,
+                hudless_pair_ready ? 1 : 0,
+                static_cast<std::uint64_t>(display_time),
+                slot.hudless_source
+                    ? static_cast<std::uint64_t>(
+                          slot.hudless_source->GetDesc().Format)
+                    : 0,
+                static_cast<std::uint64_t>(image_description.Format));
+        }
+
         if (backend == D3D12OpticalFlowBackend::nvidia) {
             const HRESULT close_result = slot.synthesis_command_list->Close();
             if (FAILED(close_result)) return close_result;
@@ -3297,9 +3445,33 @@ struct D3D12FrameSynthesizer::Impl {
             cinema_projection
                 ? linear_color_view_format(generated->GetDesc().Format, view_format)
                 : view_format);
+        if (hudless_pair_ready) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC scene_view{};
+            scene_view.Format = view_format;
+            scene_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            scene_view.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            scene_view.Texture2DArray.MipLevels = 1;
+            scene_view.Texture2DArray.ArraySize = image_description.DepthOrArraySize;
+            const auto cpu_start =
+                slot.descriptor_heap->GetCPUDescriptorHandleForHeapStart();
+            for (UINT slice = 0; slice < image_description.DepthOrArraySize; ++slice) {
+                device->CreateShaderResourceView(
+                    slot.hudless_source.Get(), &scene_view,
+                    offset_cpu_handle(cpu_start,
+                        slice * kDescriptorBlockSize + 7U,
+                        descriptor_increment));
+            }
+        }
         const auto current_to_read = transition_barrier(
             current_resource, D3D12_RESOURCE_STATE_COMMON, kShaderReadState);
         slot.command_list->ResourceBarrier(1, &current_to_read);
+        if (hudless_pair_ready) {
+            const auto scene_to_read = transition_barrier(
+                slot.hudless_source.Get(), D3D12_RESOURCE_STATE_COMMON,
+                kShaderReadState);
+            slot.command_list->ResourceBarrier(1, &scene_to_read);
+        }
 
         ID3D12DescriptorHeap* heaps[] = {slot.descriptor_heap.Get()};
         slot.command_list->SetDescriptorHeaps(1, heaps);
@@ -3310,7 +3482,9 @@ struct D3D12FrameSynthesizer::Impl {
         slot.command_list->SetPipelineState(
             cinema_projection
                 ? fsr_cinema_panel_pipeline.Get()
-                : fsr_reprojection_pipeline.Get());
+                : hudless_pair_ready
+                    ? fsr_post_hud_pipeline.Get()
+                    : fsr_reprojection_pipeline.Get());
         slot.command_list->IASetPrimitiveTopology(
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         const auto gpu_start =
@@ -3392,6 +3566,12 @@ struct D3D12FrameSynthesizer::Impl {
         }
 
         synthetic_target_state(slot.command_list.Get(), synthetic_destination_index, false);
+        if (hudless_pair_ready) {
+            const auto scene_to_common = transition_barrier(
+                slot.hudless_source.Get(), kShaderReadState,
+                D3D12_RESOURCE_STATE_COMMON);
+            slot.command_list->ResourceBarrier(1, &scene_to_common);
+        }
         const std::array<D3D12_RESOURCE_BARRIER, 2> before_copy{
             transition_barrier(current_resource, kShaderReadState,
                                D3D12_RESOURCE_STATE_COPY_SOURCE),
