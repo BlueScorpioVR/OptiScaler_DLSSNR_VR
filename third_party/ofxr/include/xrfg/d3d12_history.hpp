@@ -88,6 +88,9 @@ public:
     [[nodiscard]] HRESULT invalidate() noexcept;
 
     [[nodiscard]] bool initialized() const noexcept;
+    // Diagnostic observation only; a pending CPU observation is legal when
+    // the GPU consumer enqueues a producer-fence wait.
+    [[nodiscard]] std::uint64_t diagnostic_completed_value() const noexcept;
 
 private:
     struct Impl;

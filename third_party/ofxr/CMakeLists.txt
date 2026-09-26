@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(XRFrameGenerationBridge VERSION 0.72.0 LANGUAGES CXX)
+project(XRFrameGenerationBridge VERSION 0.223.0 LANGUAGES CXX)
 
 # V23043 embeds the unchanged layer implementation in the OptiScaler module.
 set(XRFG_TEST_LAYER_DLL "" CACHE FILEPATH "Combined DLL tested by the layer harnesses")
@@ -55,6 +55,14 @@ endif()
 if(XRFG_BUILD_TESTS)
     enable_testing()
     include("${CMAKE_CURRENT_SOURCE_DIR}/../../tests/ofxr_host_tests.cmake")
+    add_executable(xrfg_three_slot_buffer_tests tests/three_slot_buffer_tests.cpp)
+    target_include_directories(xrfg_three_slot_buffer_tests PRIVATE include)
+    target_compile_features(xrfg_three_slot_buffer_tests PRIVATE cxx_std_20)
+    add_test(NAME xrfg_three_slot_buffer_tests COMMAND xrfg_three_slot_buffer_tests)
+    add_executable(xrfg_luke_counter_probe_tests tests/luke_counter_probe_tests.cpp)
+    target_include_directories(xrfg_luke_counter_probe_tests PRIVATE include)
+    target_compile_features(xrfg_luke_counter_probe_tests PRIVATE cxx_std_20)
+    add_test(NAME xrfg_luke_counter_probe_tests COMMAND xrfg_luke_counter_probe_tests)
     add_executable(xrfg_core_tests tests/core_tests.cpp)
     target_link_libraries(xrfg_core_tests PRIVATE xrfg_core)
     if(MSVC)
@@ -116,6 +124,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     endif()
 
     set(XRFG_GENERATED_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated-shaders")
+    set(XRFG_GAME_MOTION_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/game_motion_synthesize_midpoint_pixel_shader.hpp")
     set(XRFG_PACK_INPUT_HEADER "${XRFG_GENERATED_SHADER_DIR}/pack_flow_input_shader.hpp")
     set(XRFG_FULLSCREEN_VERTEX_HEADER "${XRFG_GENERATED_SHADER_DIR}/fullscreen_vertex_shader.hpp")
     set(XRFG_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/synthesize_midpoint_pixel_shader.hpp")
@@ -131,6 +140,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     set(XRFG_NVIDIA_FAST_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER "${XRFG_GENERATED_SHADER_DIR}/nvidia_fast_bidirectional_synthesize_midpoint_pixel_shader.hpp")
     add_custom_command(
         OUTPUT
+            "${XRFG_GAME_MOTION_SYNTHESIZE_PIXEL_HEADER}"
             "${XRFG_PACK_INPUT_HEADER}"
             "${XRFG_FULLSCREEN_VERTEX_HEADER}"
             "${XRFG_SYNTHESIZE_PIXEL_HEADER}"
@@ -145,6 +155,10 @@ if(WIN32 AND XRFG_BUILD_LAYER)
             "${XRFG_NVIDIA_FAST_SYNTHESIZE_PIXEL_HEADER}"
             "${XRFG_NVIDIA_FAST_BIDIRECTIONAL_SYNTHESIZE_PIXEL_HEADER}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${XRFG_GENERATED_SHADER_DIR}"
+        COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T ps_5_1 /E SynthesizeGameMotionMidpointPS
+            /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
+            /Fh "${XRFG_GAME_MOTION_SYNTHESIZE_PIXEL_HEADER}" /Vn g_xrfg_game_motion_synthesize_midpoint_pixel_shader
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/d3d12/frame_synthesis.hlsl"
         COMMAND "${XRFG_FXC_EXECUTABLE}" /nologo /T cs_5_1 /E PackFlowInput
             /O3 /WX /Ges /Qstrip_debug /Qstrip_reflect
             /Fh "${XRFG_PACK_INPUT_HEADER}" /Vn g_xrfg_pack_flow_input_shader
@@ -203,6 +217,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         VERBATIM)
 
     add_library(xrfg_d3d12_history STATIC
+        "${XRFG_GAME_MOTION_SYNTHESIZE_PIXEL_HEADER}"
         src/common/dlss_motion_vectors.cpp
         src/common/fsr_frame_generation.cpp
         src/d3d11/d3d11_d3d12_interop.cpp
@@ -246,7 +261,14 @@ if(WIN32 AND XRFG_BUILD_LAYER)
 
     add_library(xrfg_bridge_flight_logger STATIC
         src/layer/bridge_flight_logger.cpp
+        src/layer/luke_counter_probe.cpp
+        src/common/ram_timing.cpp
         include/xrfg/bridge_flight_logger.hpp)
+    add_library(xrfg_frame_capture STATIC src/d3d11/frame_capture.cpp)
+    target_include_directories(xrfg_frame_capture PUBLIC include)
+    target_compile_features(xrfg_frame_capture PUBLIC cxx_std_20)
+    target_compile_definitions(xrfg_frame_capture PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(xrfg_frame_capture PUBLIC d3d11 d3dcompiler user32)
     target_include_directories(xrfg_bridge_flight_logger PUBLIC include)
     target_link_libraries(xrfg_d3d12_history PUBLIC xrfg_bridge_flight_logger)
     target_compile_features(xrfg_bridge_flight_logger PUBLIC cxx_std_20)
@@ -302,7 +324,8 @@ if(WIN32 AND XRFG_BUILD_LAYER)
         xrfg_d3d12_history
         xrfg_bridge_flight_logger
         xrfg_fps_overlay
-        xrfg_implicit_layer)
+        xrfg_implicit_layer
+        psapi xrfg_frame_capture)
     target_compile_features(XR_APILAYER_XRFrameBridge_diagnostic PRIVATE cxx_std_20)
     target_compile_definitions(XR_APILAYER_XRFrameBridge_diagnostic PRIVATE
         NOMINMAX
@@ -323,6 +346,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
     if(XRFG_BUILD_STANDALONE)
         add_library(xrfg_standalone_core STATIC
             src/tray/standalone_launcher.cpp
+            src/common/ram_timing.cpp
             include/xrfg/standalone_launcher.hpp)
         target_include_directories(xrfg_standalone_core PUBLIC include)
         target_compile_features(xrfg_standalone_core PUBLIC cxx_std_20)
@@ -415,7 +439,83 @@ if(WIN32 AND XRFG_BUILD_LAYER)
                 WIN32_LEAN_AND_MEAN)
         endif()
         add_test(NAME xrfg_bridge_flight_logger_tests
-            COMMAND xrfg_bridge_flight_logger_tests)
+                COMMAND xrfg_bridge_flight_logger_tests)
+        add_executable(xrfg_ram_timing_tests tests/ram_timing_tests.cpp)
+        target_link_libraries(xrfg_ram_timing_tests PRIVATE xrfg_bridge_flight_logger)
+        target_compile_features(xrfg_ram_timing_tests PRIVATE cxx_std_20)
+        target_compile_definitions(xrfg_ram_timing_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        add_test(NAME xrfg_ram_timing_tests COMMAND xrfg_ram_timing_tests)
+        add_test(NAME xrfg_ram_timing_disabled COMMAND xrfg_ram_timing_tests disabled)
+        set_tests_properties(xrfg_ram_timing_tests PROPERTIES TIMEOUT 30)
+
+        add_executable(xrfg_frame_capture_tests tests/frame_capture_tests.cpp)
+        target_link_libraries(xrfg_frame_capture_tests PRIVATE xrfg_frame_capture)
+        target_compile_definitions(xrfg_frame_capture_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        add_test(NAME xrfg_frame_capture_tests COMMAND xrfg_frame_capture_tests)
+        set_tests_properties(xrfg_frame_capture_tests PROPERTIES TIMEOUT 30)
+
+        add_executable(xrfg_three_slot_director_tests
+            tests/three_slot_director_tests.cpp
+            src/common/embedded_control.cpp)
+        target_include_directories(xrfg_three_slot_director_tests PRIVATE
+            include "${XRFG_OPENXR_SDK_ROOT}/include")
+        target_compile_features(xrfg_three_slot_director_tests PRIVATE cxx_std_20)
+        target_compile_definitions(xrfg_three_slot_director_tests PRIVATE
+            NOMINMAX WIN32_LEAN_AND_MEAN XR_USE_GRAPHICS_API_D3D11
+            XR_USE_GRAPHICS_API_D3D12 XR_USE_PLATFORM_WIN32 OFXR_PROVIDER_API_EXPORTS)
+        target_link_libraries(xrfg_three_slot_director_tests PRIVATE
+            xrfg_core xrfg_d3d12_history xrfg_bridge_flight_logger
+            xrfg_fps_overlay xrfg_implicit_layer psapi xrfg_frame_capture)
+        add_test(NAME xrfg_three_slot_director_tests COMMAND xrfg_three_slot_director_tests)
+        add_test(NAME xrfg_luke_admission COMMAND xrfg_three_slot_director_tests luke-unit)
+        add_test(NAME xrfg_luke_cycle_clock COMMAND xrfg_three_slot_director_tests luke-clock)
+        set_tests_properties(xrfg_luke_cycle_clock PROPERTIES TIMEOUT 10)
+        add_test(NAME xrfg_luke_gpu_pipeline COMMAND xrfg_three_slot_director_tests luke-gpu)
+        add_test(NAME xrfg_luke_ram_pipeline COMMAND xrfg_three_slot_director_tests luke-ram)
+        set_tests_properties(xrfg_luke_admission xrfg_luke_gpu_pipeline xrfg_luke_ram_pipeline PROPERTIES TIMEOUT 30)
+        add_test(NAME xrfg_three_slot_composition_tests COMMAND xrfg_three_slot_director_tests composition)
+        add_test(NAME xrfg_three_slot_capture_integration COMMAND xrfg_three_slot_director_tests capture)
+        set_tests_properties(xrfg_three_slot_capture_integration PROPERTIES TIMEOUT 60)
+        set_tests_properties(xrfg_three_slot_composition_tests PROPERTIES TIMEOUT 60)
+        add_test(NAME xrfg_three_slot_transition_tests COMMAND xrfg_three_slot_director_tests transition)
+        set_tests_properties(xrfg_three_slot_transition_tests PROPERTIES TIMEOUT 60)
+        set_tests_properties(xrfg_three_slot_director_tests PROPERTIES TIMEOUT 20)
+        add_test(NAME xrfg_three_slot_nvidia_d3d11_pipeline
+              COMMAND xrfg_three_slot_director_tests gpu)
+        add_test(NAME xrfg_ram_timing_d3d11 COMMAND xrfg_three_slot_director_tests ram)
+        add_test(NAME xrfg_capture_gap_d3d11 COMMAND xrfg_three_slot_director_tests gap)
+        set_tests_properties(xrfg_three_slot_nvidia_d3d11_pipeline PROPERTIES TIMEOUT 30)
+
+        add_executable(xrfg_three_slot_d3d12_tests tests/three_slot_d3d12_tests.cpp
+            src/common/embedded_control.cpp)
+        target_include_directories(xrfg_three_slot_d3d12_tests PRIVATE include "${XRFG_OPENXR_SDK_ROOT}/include")
+        target_compile_features(xrfg_three_slot_d3d12_tests PRIVATE cxx_std_20)
+        target_compile_definitions(xrfg_three_slot_d3d12_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+            XR_USE_GRAPHICS_API_D3D11 XR_USE_GRAPHICS_API_D3D12 XR_USE_PLATFORM_WIN32 OFXR_PROVIDER_API_EXPORTS)
+        target_link_libraries(xrfg_three_slot_d3d12_tests PRIVATE xrfg_core xrfg_d3d12_history
+            xrfg_bridge_flight_logger xrfg_fps_overlay xrfg_implicit_layer psapi xrfg_frame_capture)
+        add_test(NAME xrfg_three_slot_d3d12_split COMMAND xrfg_three_slot_d3d12_tests)
+        add_test(NAME xrfg_ram_timing_d3d12 COMMAND xrfg_three_slot_d3d12_tests ram)
+        add_test(NAME xrfg_three_slot_d3d12_array COMMAND xrfg_three_slot_d3d12_tests array)
+        add_test(NAME xrfg_fsr_inline_missing_guides COMMAND xrfg_three_slot_d3d12_tests fsr-inline-wait)
+        if(EXISTS "${XRFG_FIDELITYFX_SDK_ROOT}/../PrebuiltSignedDLL/amd_fidelityfx_dx12.dll")
+            add_custom_command(TARGET xrfg_three_slot_d3d12_tests POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${XRFG_FIDELITYFX_SDK_ROOT}/../PrebuiltSignedDLL/amd_fidelityfx_dx12.dll"
+                    "$<TARGET_FILE_DIR:xrfg_three_slot_d3d12_tests>/ofxr_amd_fidelityfx_framegeneration_dx12.dll")
+            add_test(NAME xrfg_fsr_inline_gpu COMMAND xrfg_three_slot_d3d12_tests fsr-inline)
+            set_tests_properties(xrfg_fsr_inline_gpu PROPERTIES TIMEOUT 60)
+        endif()
+        set_tests_properties(xrfg_fsr_inline_missing_guides PROPERTIES TIMEOUT 60)
+        add_test(NAME xrfg_capture_gap_d3d12_split COMMAND xrfg_three_slot_d3d12_tests gap-split)
+        add_test(NAME xrfg_capture_gap_d3d12_array COMMAND xrfg_three_slot_d3d12_tests gap-array)
+        set_tests_properties(xrfg_capture_gap_d3d11 xrfg_capture_gap_d3d12_split xrfg_capture_gap_d3d12_array PROPERTIES TIMEOUT 30)
+        add_test(NAME xrfg_three_slot_d3d12_repeated_eye COMMAND xrfg_three_slot_d3d12_tests repeat)
+        add_test(NAME xrfg_three_slot_d3d12_promotion_split COMMAND xrfg_three_slot_d3d12_tests promotion-split)
+        add_test(NAME xrfg_three_slot_d3d12_promotion_array COMMAND xrfg_three_slot_d3d12_tests promotion-array)
+        set_tests_properties(xrfg_three_slot_d3d12_split xrfg_three_slot_d3d12_array
+            xrfg_three_slot_d3d12_repeated_eye xrfg_three_slot_d3d12_promotion_split
+            xrfg_three_slot_d3d12_promotion_array PROPERTIES TIMEOUT 60)
 
         add_executable(xrfg_layer_smoke tests/layer_smoke.cpp)
         target_include_directories(xrfg_layer_smoke PRIVATE
@@ -576,6 +676,7 @@ if(WIN32 AND XRFG_BUILD_LAYER)
                 WIN32_LEAN_AND_MEAN)
         endif()
         add_test(NAME xrfg_d3d12_history_tests COMMAND xrfg_d3d12_history_tests)
+
 
         add_executable(xrfg_vertical_fov_tests tests/vertical_fov_tests.cpp)
         target_include_directories(xrfg_vertical_fov_tests PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}/generated-shaders")

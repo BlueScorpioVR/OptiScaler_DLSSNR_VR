@@ -745,6 +745,7 @@ struct D3D11D3D12SwapchainInterop::Impl {
         return S_OK;
     }
 
+
     [[nodiscard]] HRESULT wait_for_idle() noexcept {
         if (last_fence_value == 0) {
             return S_OK;
@@ -895,6 +896,7 @@ HRESULT D3D11D3D12SwapchainInterop::publish(
         return E_FAIL;
     }
 }
+
 
 HRESULT D3D11D3D12SwapchainInterop::wait_for_idle() noexcept {
     try {

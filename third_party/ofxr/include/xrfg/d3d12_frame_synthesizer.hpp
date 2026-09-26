@@ -53,7 +53,15 @@ struct D3D12PresentationTransform {
 struct D3D12FrameSynthesisTicket {
     std::uint64_t previous_serial{};
     std::uint64_t current_serial{};
+    // The value the whole pair completes at, which on the deferred path is
+    // what the held-back current copy will signal - so it is not signalled
+    // until flush_current_copy submits that copy, a display period later.
     std::uint64_t fence_value{};
+    // The value at which the synthetic's pixels exist, signalled as soon as
+    // the synthesis work is queued. Anything waiting for the synthetic and
+    // only the synthetic must use this: waiting on fence_value instead
+    // blocks until a copy that has not been submitted yet completes.
+    std::uint64_t synthetic_fence_value{};
     std::uint32_t work_slot{};
     std::uint32_t synthetic_destination_index{
         std::numeric_limits<std::uint32_t>::max()};
@@ -71,6 +79,10 @@ struct D3D12NvidiaGpuTiming {
     std::uint64_t eye1_microseconds{};
     std::uint64_t composition_microseconds{};
     std::uint64_t total_microseconds{};
+    // The pair's whole GPU span, as QueryPerformanceCounter values. Zero
+    // when the device offered no calibration.
+    std::uint64_t gpu_begin_qpc{};
+    std::uint64_t gpu_end_qpc{};
     std::uint32_t eye_count{};
 };
 
@@ -90,16 +102,26 @@ enum class D3D12NvidiaPerformancePreset {
     fast,
 };
 
-enum class D3D12NvidiaInputScale {
+// Ratio the optical-flow input is packed at. Shared by both backends: the
+// FidelityFX path ran at full resolution and honoured no scale at all, while
+// NVIDIA has defaulted to half per axis all along. One control now covers both.
+enum class D3D12OpticalFlowInputScale {
     full,
     three_quarter,
     half,
 };
 
+// The name the NVIDIA options and the tray settings already use.
+using D3D12NvidiaInputScale = D3D12OpticalFlowInputScale;
+
 struct D3D12NvidiaOpticalFlowOptions {
     D3D12NvidiaPerformancePreset preset{
         D3D12NvidiaPerformancePreset::medium};
-    D3D12NvidiaInputScale input_scale{D3D12NvidiaInputScale::half};
+    // Applies to whichever backend is running: the FidelityFX pack and flow
+    // honour it too, so there is one input-resolution control rather than
+    // one per backend.
+    D3D12OpticalFlowInputScale input_scale{
+        D3D12OpticalFlowInputScale::half};
     bool bidirectional{};
 };
 
@@ -149,6 +171,11 @@ public:
         std::shared_ptr<const DlssMotionVectorSet> motion_vectors = {},
         D3D12PresentationTransform presentation_transform = {}) noexcept;
 
+    // Read-only preflight after the prior worker completed. A forward capture
+    // gap requires re-priming the entire stereo transaction, not one eye.
+    [[nodiscard]] bool has_capture_gap(const D3D12HistoryCaptureTicket& current) const noexcept;
+    [[nodiscard]] bool can_pair_fsr(std::shared_ptr<const DlssMotionVectorSet> current) const noexcept;
+
     [[nodiscard]] HRESULT submit_pair(
         const D3D12HistoryCaptureTicket& current,
         std::span<const D3D12ReprojectionView> current_source_views,
@@ -158,11 +185,57 @@ public:
         D3D12FrameSynthesisTicket* ticket,
         std::optional<OverlayPlacement> debug_marker = std::nullopt,
         std::shared_ptr<const DlssMotionVectorSet> motion_vectors = {},
+        // Records the current output's copy but leaves it unsubmitted for
+        // flush_current_copy to hand over once the synthetic frame has gone
+        // to the runtime. Defaults off: a caller that never flushes would
+        // publish a stale current frame.
+        bool defer_current_copy = false,
+        // Where the synthetic sits between the previous capture and the
+        // current one, 0 at the previous and 1 at the current. Half is right
+        // only when the application runs at exactly half the display rate,
+        // because only then are the two captures two display periods apart
+        // and the synthetic shown one period before the current frame.
+        // Clamped internally; out-of-range values fall back to half.
+        float interpolation_fraction = 0.5F,
         D3D12PresentationTransform presentation_transform = {}) noexcept;
+
+    // Executes the current output's copy, which submit_pair records but
+    // deliberately leaves unsubmitted. The synthetic frame is handed to the
+    // runtime a display period before the current one, and a runtime waits
+    // for the whole queue when it takes a frame, so a copy left queued ahead
+    // of the synthetic makes the frame with the tighter deadline wait for a
+    // full-resolution copy it never reads. The caller submits the synthetic
+    // first and calls this immediately afterwards, leaving the copy a whole
+    // period to finish before the current frame needs it.
+    //
+    // Safe to call when nothing is pending. Submission entry points flush
+    // any copy still outstanding themselves, so a caller that never gets
+    // here costs a frame of latency rather than correctness.
+    // Submits the held-back copy. consumer_queue, when the synthesis runs on
+    // a queue of its own, is made to wait for that copy here rather than at
+    // the pair's submission: at submission the copy has not been queued yet,
+    // so the wait would park the consumer for a whole display period.
+    [[nodiscard]] HRESULT flush_current_copy(
+        ID3D12CommandQueue* consumer_queue = nullptr) noexcept;
 
     // Relinquishes the retained rolling source against its last GPU-use fence.
     // This is nonblocking and is required before history invalidation.
     [[nodiscard]] HRESULT retire_previous() noexcept;
+
+    // Called after the runtime has paced the next application frame but before
+    // that frame is returned to the application. Gives the previous complete
+    // bridge transaction a bounded opportunity to leave the shared graphics
+    // queue before the game records and submits its next frame. A timeout is
+    // transient ERROR_BUSY; submission remains nonblocking and cannot enqueue
+    // another transaction while this fence is pending.
+    [[nodiscard]] HRESULT wait_for_previous_submission(
+        std::uint32_t timeout_milliseconds) noexcept;
+
+    // Flushes any deferred current copy, then polls the last submission fence.
+    // S_OK means another transaction may begin; ERROR_BUSY leaves the real
+    // frame to the caller without blocking the application thread.
+    [[nodiscard]] HRESULT previous_submission_available() noexcept;
+
 
     [[nodiscard]] HRESULT wait_for_idle() noexcept;
     // Caller excludes presenter use and new history captures. Keeps XR destinations.
@@ -175,6 +248,31 @@ public:
     // when none is ready, or an error for an invalid output pointer/readback.
     [[nodiscard]] HRESULT consume_nvidia_gpu_timing(
         D3D12NvidiaGpuTiming* timing) noexcept;
+
+    // Makes another queue wait on this ticket's completion before its own
+    // later work runs. Required when the synthesizer owns a queue of its own
+    // and writes into swapchain images: an OpenXR D3D12 runtime synchronizes
+    // those images against the queue the application supplied at session
+    // create, and sees nothing submitted elsewhere. Joining the two queues
+    // here is what makes the runtime's own ordering cover the synthesis. This
+    // is a GPU-side wait queued on the target; it never blocks the CPU.
+    [[nodiscard]] HRESULT synchronize_consumer_queue(
+        ID3D12CommandQueue* queue,
+        const D3D12FrameSynthesisTicket& ticket) noexcept;
+
+    // The other half of that join, and the one a fence alone cannot be
+    // assumed to cover. xrWaitSwapchainImage makes an image safe to write on
+    // the queue the application supplied at session create; the runtime knows
+    // nothing about a private synthesis queue and inserts no wait for it. So
+    // the guarantee has to be carried across explicitly: the application's
+    // queue signals once the acquire has returned, and the synthesis queue
+    // waits on that before it writes. Without it the synthesis can land in an
+    // image the compositor has not finished with, which shows up as a
+    // synthetic that was generated, paced and complete and still never
+    // reached the headset. Call once per pair, after the images are acquired
+    // and before the pair is submitted.
+    [[nodiscard]] HRESULT synchronize_producer_queue(
+        ID3D12CommandQueue* queue) noexcept;
 
     [[nodiscard]] bool initialized() const noexcept;
 

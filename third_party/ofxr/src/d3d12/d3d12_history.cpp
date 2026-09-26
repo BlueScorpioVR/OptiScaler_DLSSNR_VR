@@ -1,11 +1,13 @@
 #include "xrfg/d3d12_history.hpp"
-#include "xrfg/gpu_flight_diagnostics.hpp"
+#include "xrfg/bridge_flight_logger.hpp"
+#include "xrfg/d3d12_ram_timing.hpp"
 
 #include <windows.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <utility>
@@ -15,6 +17,13 @@ namespace xrfg {
 namespace {
 
 using Microsoft::WRL::ComPtr;
+
+void dred_marker(ID3D12GraphicsCommandList* command_list, const char* label) noexcept {
+    if (command_list != nullptr && label != nullptr &&
+        bridge_flight_logger().enabled()) {
+        command_list->SetMarker(1U, label, static_cast<UINT>(std::strlen(label)));
+    }
+}
 
 [[nodiscard]] bool matching_description(
     const D3D12_RESOURCE_DESC& left,
@@ -85,6 +94,7 @@ using Microsoft::WRL::ComPtr;
 
 struct D3D12SwapchainHistory::Impl {
     struct HistorySlot {
+        D3D12RamTiming<2> ram_gpu;
         ComPtr<ID3D12Resource> resource;
         ComPtr<ID3D12CommandAllocator> capture_allocator;
         ComPtr<ID3D12GraphicsCommandList> capture_list;
@@ -167,6 +177,10 @@ struct D3D12SwapchainHistory::Impl {
             }
             return result;
         }
+        // DRED reports this stable name if a device removal stops inside the bridge's
+        // history copy, distinguishing it from game, NGX and synthesis work.
+        slot.capture_list->SetName(L"OFXR History Capture");
+        slot.ram_gpu.initialize(device.Get(),queue.Get(),BridgeFlightOperation::gpu_history);
         result = slot.capture_list->Close();
         if (FAILED(result) && failure_stage != nullptr) {
             *failure_stage =
@@ -330,8 +344,6 @@ struct D3D12SwapchainHistory::Impl {
     }
 
     [[nodiscard]] HRESULT prepare_slot_for_capture(HistorySlot& slot) noexcept {
-        log_gpu_fence(1, producer_fence.Get(), slot.capture_fence_value);
-        log_gpu_fence(2, slot.consumer_fence.Get(), slot.consumer_fence_value);
         if (slot.active_lease_serial != 0) {
             return HRESULT_FROM_WIN32(ERROR_BUSY);
         }
@@ -351,6 +363,7 @@ struct D3D12SwapchainHistory::Impl {
         if (producer_status == S_FALSE) {
             return HRESULT_FROM_WIN32(ERROR_BUSY);
         }
+        if (producer_status == S_OK) slot.ram_gpu.harvest();
         return producer_status;
     }
 
@@ -420,6 +433,9 @@ struct D3D12SwapchainHistory::Impl {
             return result;
         }
 
+        dred_marker(slot.capture_list.Get(), "OFXR history begin");
+        slot.ram_gpu.mark(slot.capture_list.Get(),0);
+
         ID3D12Resource* const source = source_images[source_index].Get();
         const std::array<D3D12_RESOURCE_BARRIER, 2> before_copy{
             transition_barrier(source, release_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -431,6 +447,7 @@ struct D3D12SwapchainHistory::Impl {
         slot.capture_list->ResourceBarrier(
             static_cast<UINT>(before_copy.size()),
             before_copy.data());
+        dred_marker(slot.capture_list.Get(), "OFXR history copy");
         slot.capture_list->CopyResource(slot.resource.Get(), source);
 
         const std::array<D3D12_RESOURCE_BARRIER, 2> after_copy{
@@ -443,6 +460,9 @@ struct D3D12SwapchainHistory::Impl {
         slot.capture_list->ResourceBarrier(
             static_cast<UINT>(after_copy.size()),
             after_copy.data());
+        dred_marker(slot.capture_list.Get(), "OFXR history complete");
+        slot.ram_gpu.mark(slot.capture_list.Get(),1);
+        slot.ram_gpu.resolve(slot.capture_list.Get());
 
         result = slot.capture_list->Close();
         if (FAILED(result)) {
@@ -451,6 +471,7 @@ struct D3D12SwapchainHistory::Impl {
         }
 
         std::uint64_t fence_value = 0;
+        slot.ram_gpu.submitted(reinterpret_cast<UINT64>(producer_fence.Get()),next_serial);
         result = execute_and_signal(slot.capture_list.Get(), &fence_value);
         if (FAILED(result)) {
             return result;
@@ -679,15 +700,7 @@ HRESULT D3D12SwapchainHistory::capture(
             }
             return E_UNEXPECTED;
         }
-        auto& log = bridge_flight_logger();
-        const auto token = log.begin(BridgeFlightOperation::history_capture,
-            reinterpret_cast<std::uintptr_t>(this), source_index);
-        const HRESULT result = impl_->capture(source_index, ticket);
-        log.end(token, BridgeFlightOperation::history_capture, result,
-            reinterpret_cast<std::uintptr_t>(this), ticket ? ticket->serial : 0,
-            ticket ? ticket->fence_value : 0);
-        log_gpu_failure(impl_->device.Get(), result, reinterpret_cast<std::uintptr_t>(this));
-        return result;
+        return impl_->capture(source_index, ticket);
     } catch (const std::bad_alloc&) {
         if (ticket != nullptr) {
             *ticket = {};
@@ -799,6 +812,13 @@ HRESULT D3D12SwapchainHistory::invalidate() noexcept {
     } catch (...) {
         return E_FAIL;
     }
+}
+
+std::uint64_t D3D12SwapchainHistory::diagnostic_completed_value() const noexcept {
+    try {
+        std::scoped_lock lock(mutex_);
+        return impl_ && impl_->producer_fence ? impl_->producer_fence->GetCompletedValue() : 0;
+    } catch (...) { return 0; }
 }
 
 bool D3D12SwapchainHistory::initialized() const noexcept {

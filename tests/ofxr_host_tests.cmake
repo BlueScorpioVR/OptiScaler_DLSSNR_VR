@@ -1,17 +1,5 @@
-add_executable(nr_handle_state_table_tests "${CMAKE_CURRENT_LIST_DIR}/nr_handle_state_table_tests.cpp")
-target_compile_features(nr_handle_state_table_tests PRIVATE cxx_std_20)
-target_compile_options(nr_handle_state_table_tests PRIVATE /UNDEBUG)
-add_test(NAME nr_handle_state_table_tests COMMAND nr_handle_state_table_tests)
-add_executable(nr_active_color_smoke "${CMAKE_CURRENT_LIST_DIR}/nr_active_color_smoke.cpp")
-target_compile_features(nr_active_color_smoke PRIVATE cxx_std_20)
-target_compile_definitions(nr_active_color_smoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(nr_active_color_smoke PRIVATE d3d12 dxgi)
-add_test(NAME nr_active_color_smoke COMMAND nr_active_color_smoke)
-add_executable(dxgi_window_size_smoke "${CMAKE_CURRENT_LIST_DIR}/dxgi_window_size_smoke.cpp")
-target_compile_features(dxgi_window_size_smoke PRIVATE cxx_std_20)
-target_compile_definitions(dxgi_window_size_smoke PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-target_link_libraries(dxgi_window_size_smoke PRIVATE d3d11 dxgi dcomp)
-add_test(NAME dxgi_window_size_smoke COMMAND dxgi_window_size_smoke)
+# The three retired pre-Wilsjo host harnesses referenced absent headers and
+# have no implementation in this source line. NR contract/DRED tests remain.
 
 add_executable(xrfg_embedded_menu_tests "${CMAKE_CURRENT_LIST_DIR}/../third_party/ofxr/tests/layer_manual_disarm_tests.cpp")
 target_compile_features(xrfg_embedded_menu_tests PRIVATE cxx_std_20)

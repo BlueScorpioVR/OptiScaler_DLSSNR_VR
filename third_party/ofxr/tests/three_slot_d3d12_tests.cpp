@@ -1,0 +1,404 @@
+// Real D3D12/NVIDIA and the actual release/EndFrame/worker/director code.
+// The runtime alone is mocked. Sources are poisoned after intercepted release.
+#include "../src/layer/openxr_layer.cpp"
+#include <d3d12sdklayers.h>
+#include <iostream>
+#include <stdexcept>
+#include <unordered_set>
+#include "ram_timing_fixture.hpp"
+
+namespace {
+using Microsoft::WRL::ComPtr;
+std::shared_ptr<SessionState> session_state;
+std::mutex test_gpu, resources_mutex;
+std::unordered_map<XrSwapchain, ComPtr<ID3D12Resource>> images;
+std::unordered_set<XrSwapchain> synthetic_handles;
+std::vector<std::pair<unsigned, bool>> submissions;
+std::atomic<unsigned> waits{}, begins{}, ends{}, created{}, destroyed{};
+XrTime runtime_time = 1000000000;
+bool correct = true;
+bool alternating_eyes{};
+bool promotion_test{};
+bool fsr_test{}, fsr_missing{};
+ComPtr<ID3D12Fence> promotion_gate;
+std::jthread promotion_unblock;
+std::atomic<bool> promotion_gate_released{};
+unsigned promotion_gate_count{};
+void require(bool b, const char* s) { if (!b) throw std::runtime_error(s); }
+void hr(HRESULT r, const char* s) { require(SUCCEEDED(r), s); }
+
+ComPtr<ID3D12Resource> resource(unsigned slices, bool buffer = false,
+    D3D12_HEAP_TYPE heap_type = D3D12_HEAP_TYPE_DEFAULT, UINT64 bytes = 0,
+    D3D12_RESOURCE_STATES initial = D3D12_RESOURCE_STATE_COMMON,
+    DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) {
+    D3D12_HEAP_PROPERTIES heap{}; heap.Type = heap_type;
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = buffer ? D3D12_RESOURCE_DIMENSION_BUFFER : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width = buffer ? bytes : 256; d.Height = buffer ? 1 : 128;
+    d.DepthOrArraySize = static_cast<UINT16>(buffer ? 1 : slices); d.MipLevels = 1;
+    d.Format = buffer ? DXGI_FORMAT_UNKNOWN : format;
+    d.SampleDesc.Count = 1;
+    d.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    d.Flags = buffer ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    ComPtr<ID3D12Resource> r;
+    hr(session_state->d3d12_device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&d,initial,nullptr,
+        IID_PPV_ARGS(&r)), "resource");
+    return r;
+}
+
+template<class Record> void commands(Record record) {
+    std::scoped_lock lock(test_gpu);
+    ComPtr<ID3D12CommandAllocator> allocator; ComPtr<ID3D12GraphicsCommandList> list;
+    hr(session_state->d3d12_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),"allocator");
+    hr(session_state->d3d12_device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list)),"list");
+    record(list.Get()); hr(list->Close(),"close");
+    ID3D12CommandList* lists[]={list.Get()}; session_state->d3d12_queue->ExecuteCommandLists(1,lists);
+    ComPtr<ID3D12Fence> fence;
+    hr(session_state->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)),"fence");
+    hr(session_state->d3d12_queue->Signal(fence.Get(),1),"signal");
+    hr(wait_composition_fence(fence.Get(),1),"test GPU completion");
+}
+void barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+    D3D12_RESOURCE_BARRIER x{}; x.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    x.Transition={r,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,a,b}; list->ResourceBarrier(1,&x);
+}
+void fill(ID3D12Resource* r, unsigned red, unsigned green, bool stereo = false) {
+    auto desc=r->GetDesc(); std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layout(desc.DepthOrArraySize);
+    UINT64 bytes=0; session_state->d3d12_device->GetCopyableFootprints(&desc,0,desc.DepthOrArraySize,0,layout.data(),nullptr,nullptr,&bytes);
+    auto upload=resource(1,true,D3D12_HEAP_TYPE_UPLOAD,bytes,D3D12_RESOURCE_STATE_GENERIC_READ);
+    void* mapped=nullptr; hr(upload->Map(0,nullptr,&mapped),"upload map");
+    for(unsigned slice=0;slice<desc.DepthOrArraySize;++slice) for(unsigned y=0;y<128;++y) {
+        auto* row=reinterpret_cast<unsigned*>(static_cast<unsigned char*>(mapped)+layout[slice].Offset+y*layout[slice].Footprint.RowPitch);
+        for(unsigned x=0;x<256;++x) row[x]=0xff200000u|((stereo && slice ? 160 : green)<<8)|red;
+    }
+    upload->Unmap(0,nullptr);
+    commands([&](auto* list){
+        barrier(list,r,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_DEST);
+        for(unsigned slice=0;slice<desc.DepthOrArraySize;++slice) {
+            D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource=r; dst.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex=slice;
+            D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource=upload.Get(); src.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; src.PlacedFootprint=layout[slice];
+            list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        }
+        barrier(list,r,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_RENDER_TARGET);
+    });
+}
+unsigned pixel(ID3D12Resource* r, unsigned slice,
+    D3D12_RESOURCE_STATES submitted_state = D3D12_RESOURCE_STATE_COMMON) {
+    auto desc=r->GetDesc(); D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout{}; UINT64 bytes=0;
+    session_state->d3d12_device->GetCopyableFootprints(&desc,slice,1,0,&layout,nullptr,nullptr,&bytes);
+    auto readback=resource(1,true,D3D12_HEAP_TYPE_READBACK,bytes,D3D12_RESOURCE_STATE_COPY_DEST);
+    commands([&](auto* list){
+        barrier(list,r,submitted_state,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource=r; src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex=slice;
+        D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource=readback.Get(); dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint=layout;
+        list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+        barrier(list,r,D3D12_RESOURCE_STATE_COPY_SOURCE,submitted_state);
+    });
+    void* mapped=nullptr; hr(readback->Map(0,nullptr,&mapped),"readback");
+    const unsigned value=*reinterpret_cast<unsigned*>(static_cast<unsigned char*>(mapped)+layout.Offset+64*layout.Footprint.RowPitch+128*4);
+    readback->Unmap(0,nullptr); return value;
+}
+XrResult XRAPI_CALL fake_create(XrSession,const XrSwapchainCreateInfo* info,XrSwapchain* h) {
+    auto r=resource(info->arraySize);
+    *h=reinterpret_cast<XrSwapchain>(std::uintptr_t(0x1000+ ++created));
+    std::scoped_lock lock(resources_mutex); images[*h]=r; return XR_SUCCESS;
+}
+XrResult XRAPI_CALL fake_enumerate(XrSwapchain h,uint32_t capacity,uint32_t* count,XrSwapchainImageBaseHeader* out) {
+    *count=1;
+    if(capacity){std::scoped_lock lock(resources_mutex);reinterpret_cast<XrSwapchainImageD3D12KHR*>(out)->texture=images.at(h).Get();}
+    return XR_SUCCESS;
+}
+XrResult XRAPI_CALL fake_destroy(XrSwapchain h) {
+    std::scoped_lock lock(resources_mutex); destroyed+=static_cast<unsigned>(images.erase(h)); return XR_SUCCESS;
+}
+XrResult XRAPI_CALL fake_wait(XrSession,const XrFrameWaitInfo*,XrFrameState* s) {
+    if(fsr_test) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ++waits; runtime_time+=8333333; s->predictedDisplayTime=runtime_time;
+    s->predictedDisplayPeriod=8333333; s->shouldRender=XR_TRUE; return XR_SUCCESS;
+}
+XrResult XRAPI_CALL fake_begin(XrSession,const XrFrameBeginInfo*) { ++begins; return XR_SUCCESS; }
+ComPtr<ID3D12Resource> submitted_image(XrSwapchain handle) {
+    {
+        std::scoped_lock lock(resources_mutex);
+        const auto found=images.find(handle);
+        if(found!=images.end()) return found->second;
+    }
+    std::scoped_lock lock(g_state_mutex);
+    const auto found=g_swapchains.find(handle);
+    require(found!=g_swapchains.end() && !found->second->enumerated_d3d12_images.empty(),
+        "submitted image is not known to the fake runtime");
+    return found->second->enumerated_d3d12_images[0];
+}
+bool is_private_image(XrSwapchain handle) {
+    std::scoped_lock lock(resources_mutex);
+    return images.contains(handle);
+}
+XrResult XRAPI_CALL fake_end(XrSession,const XrFrameEndInfo* end) {
+    ++ends;
+    const auto* projection=reinterpret_cast<const XrCompositionLayerProjection*>(end->layers[0]);
+    bool synthetic=synthetic_handles.contains(projection->views[0].subImage.swapchain);
+    const unsigned frame_id=static_cast<unsigned>(projection->views[0].pose.position.y);
+    unsigned real_id=0;
+    for(unsigned eye=0;eye<2;++eye) {
+        auto sub=projection->views[eye].subImage;
+        ComPtr<ID3D12Resource> image=submitted_image(sub.swapchain);
+        const unsigned p=pixel(image.Get(),sub.imageArrayIndex,
+            is_private_image(sub.swapchain)
+                ? D3D12_RESOURCE_STATE_COMMON
+                : D3D12_RESOURCE_STATE_RENDER_TARGET);
+        correct &= ((p>>8)&255)==(eye?160u:80u);
+        if(!synthetic) {
+            if(eye==0) real_id=p&255;
+            const unsigned expected=alternating_eyes && frame_id>1 && frame_id%2!=eye ? frame_id-1:frame_id;
+            correct &= (p&255)==expected;
+        }
+    }
+    correct &= end->layerCount==(promotion_test && !session_state->three_slot_director ? 1u : 3u);
+    for(unsigned i=1;i<end->layerCount;++i) {
+        const auto* q=reinterpret_cast<const XrCompositionLayerQuad*>(end->layers[i]);
+        correct &= q->type==XR_TYPE_COMPOSITION_LAYER_QUAD && q->subImage.imageArrayIndex==i-1;
+        ComPtr<ID3D12Resource> image=submitted_image(q->subImage.swapchain);
+        const unsigned p=pixel(image.Get(),q->subImage.imageArrayIndex,
+            is_private_image(q->subImage.swapchain)
+                ? D3D12_RESOURCE_STATE_COMMON
+                : D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const unsigned expected=i==2 ? 55 : static_cast<unsigned>(q->pose.position.y);
+        correct &= (p&255)==expected && ((p>>8)&255)==60*i;
+    }
+    submissions.emplace_back(frame_id,synthetic);
+    // Real EndFrame promotion: the synthetic has been consumed, but its
+    // deferred real endpoint has not even been submitted yet. Hold that GPU
+    // queue so a premature director start cannot hide behind a fast copy.
+    if(promotion_test && synthetic && session_state->presenter_start_requested &&
+       !session_state->three_slot_director) {
+        ++promotion_gate_count;
+        hr(session_state->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&promotion_gate)),"promotion fence");
+        hr(session_state->d3d12_synthesis_queue->Wait(promotion_gate.Get(),1),"delay deferred endpoint");
+        promotion_unblock=std::jthread([] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            promotion_gate_released=true;
+            promotion_gate->Signal(1);
+        });
+    }
+    return XR_SUCCESS;
+}
+std::shared_ptr<SwapchainState> source(unsigned id,unsigned slices,bool projection,bool static_image=false) {
+    auto c=std::make_shared<SwapchainState>(session_state, XrSwapchainCreateInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO});
+    c->handle=reinterpret_cast<XrSwapchain>(std::uintptr_t(id));
+    c->create_info={XR_TYPE_SWAPCHAIN_CREATE_INFO}; c->create_info.width=256;c->create_info.height=128;
+    c->create_info.arraySize=slices;c->create_info.faceCount=1;c->create_info.mipCount=1;c->create_info.sampleCount=1;
+    c->create_info.format=DXGI_FORMAT_R8G8B8A8_UNORM;c->create_info.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    if(static_image)c->create_info.createFlags=XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT;
+    c->enumerated_d3d12_images.push_back(resource(slices,false,D3D12_HEAP_TYPE_DEFAULT,0,D3D12_RESOURCE_STATE_RENDER_TARGET));
+    c->enumerated_image_count=1;
+    if(projection) {
+        c->d3d12_history=std::make_shared<xrfg::D3D12SwapchainHistory>();
+        ID3D12Resource* sources[]={c->enumerated_d3d12_images[0].Get()};
+        hr(c->d3d12_history->initialize(session_state->d3d12_device.Get(),session_state->d3d12_queue.Get(),sources,D3D12_RESOURCE_STATE_RENDER_TARGET),"history");
+        SwapchainEligibilityReason reason{};uint64_t detail{};
+        c->frame_generation=create_d3d12_frame_generation_swapchains(c,&reason,&detail);
+        require(c->frame_generation!=nullptr,"native generation");
+        for(auto& image:c->frame_generation->synthetic)synthetic_handles.insert(image.handle);
+    }
+    {std::scoped_lock lock(g_state_mutex);g_swapchains[c->handle]=c;}
+    return c;
+}
+void release(const std::shared_ptr<SwapchainState>& c) {
+    c->acquired_indices.push_back(0);c->front_waited=true;
+    XrSwapchainImageReleaseInfo info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    require(XR_SUCCEEDED(layer_release_swapchain_image_impl(c->handle,&info)),"source release");
+    if(!fsr_test) fill(c->enumerated_d3d12_images[0].Get(),239,238); // director must own a private capture
+}
+}
+
+int main(int argc,char** argv) {
+    RamTimingFixture capture(argc>1 && (std::string_view(argv[1])=="ram" || std::string_view(argv[1]).starts_with("gap-")));
+    ComPtr<ID3D12Fence> blocked_synthesis;
+    std::vector<std::shared_ptr<SwapchainState>> chains;
+    try {
+        ComPtr<ID3D12Debug> debug;
+        if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))debug->EnableDebugLayer();
+        auto dispatch=std::make_shared<Dispatch>(); session_state=std::make_shared<SessionState>(dispatch);
+        auto& s=session_state;s->handle=reinterpret_cast<XrSession>(0x211);s->graphics_binding=SessionGraphicsBinding::d3d12;
+        s->optical_flow_backend=xrfg::D3D12OpticalFlowBackend::nvidia;
+        fsr_test=argc>1 && std::string_view(argv[1]).starts_with("fsr-inline");
+        fsr_missing=argc>1 && std::string_view(argv[1])=="fsr-inline-wait";
+        if(fsr_test) {
+            s->frame_generation_mode=xrfg::D3D12FrameGenerationMode::fsr3;
+            dispatch->steamvr_runtime=true;
+        }
+        s->control_revision=xrfg::embedded::snapshot().revision;
+        hr(D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&s->d3d12_device)),"device");
+        D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
+        hr(s->d3d12_device->CreateCommandQueue(&q,IID_PPV_ARGS(&s->d3d12_queue)),"application queue");
+        hr(s->d3d12_device->CreateCommandQueue(&q,IID_PPV_ARGS(&s->d3d12_synthesis_queue)),"synthesis queue");
+        dispatch->create_swapchain=fake_create;dispatch->enumerate_swapchain_images=fake_enumerate;dispatch->destroy_swapchain=fake_destroy;
+        dispatch->acquire_swapchain_image=[](XrSwapchain,const XrSwapchainImageAcquireInfo*,uint32_t* index)->XrResult{*index=0;return XR_SUCCESS;};
+        dispatch->wait_swapchain_image=[](XrSwapchain,const XrSwapchainImageWaitInfo*)->XrResult{return XR_SUCCESS;};
+        dispatch->release_swapchain_image=[](XrSwapchain,const XrSwapchainImageReleaseInfo*)->XrResult{return XR_SUCCESS;};
+        dispatch->wait_frame=fake_wait;dispatch->begin_frame=fake_begin;dispatch->end_frame=fake_end;
+        {std::scoped_lock lock(g_state_mutex);g_sessions[s->handle]=s;}
+        promotion_test=argc>1 && std::string_view(argv[1]).starts_with("promotion");
+        const bool gap_test=argc>1 && std::string_view(argv[1]).starts_with("gap-");
+        const bool array=fsr_test || (argc>1 && (std::string_view(argv[1])=="array" || std::string_view(argv[1])=="promotion-array" || std::string_view(argv[1])=="gap-array"));
+        alternating_eyes=argc>1 && std::string_view(argv[1])=="repeat";
+        auto left=source(0x201,array?2:1,true);chains.push_back(left);
+        auto right=array?left:source(0x202,1,true);if(!array)chains.push_back(right);
+        auto dynamic=source(0x203,2,false);auto fixed=source(0x204,2,false,true);
+        chains.push_back(dynamic);chains.push_back(fixed);
+        ComPtr<ID3D12Resource> depth, motion;
+        if(fsr_test && !fsr_missing) {
+            depth=resource(1,false,D3D12_HEAP_TYPE_DEFAULT,0,D3D12_RESOURCE_STATE_RENDER_TARGET,DXGI_FORMAT_R32_FLOAT);
+            motion=resource(1,false,D3D12_HEAP_TYPE_DEFAULT,0,D3D12_RESOURCE_STATE_RENDER_TARGET,DXGI_FORMAT_R16G16_FLOAT);
+            D3D12_DESCRIPTOR_HEAP_DESC hd{};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV;hd.NumDescriptors=2;
+            ComPtr<ID3D12DescriptorHeap> heap;hr(s->d3d12_device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap)),"guide heap");
+            auto d=heap->GetCPUDescriptorHandleForHeapStart();auto m=d;
+            m.ptr+=s->d3d12_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            s->d3d12_device->CreateRenderTargetView(depth.Get(),nullptr,d);s->d3d12_device->CreateRenderTargetView(motion.Get(),nullptr,m);
+            commands([&](auto* list){const float z[4]{.5F,.5F,.5F,1},v[4]{};
+                list->ClearRenderTargetView(d,z,0,nullptr);list->ClearRenderTargetView(m,v,0,nullptr);
+                barrier(list,depth.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                barrier(list,motion.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);});
+        }
+        s->last_inline_frame_state={XR_TYPE_FRAME_STATE};s->last_inline_frame_state.predictedDisplayPeriod=8333333;
+        s->last_inline_frame_state.predictedDisplayTime=runtime_time;s->last_inline_frame_state.shouldRender=XR_TRUE;s->last_inline_frame_state_valid=true;
+        if(fsr_test) require(!three_slot_generation_session(s),
+            "FSR was admitted to the three-slot director");
+        if(!promotion_test && !fsr_test) {
+            require(start_continuous_presenter(s,nullptr,false),"promotion");
+            require(s->three_slot_director && s->synthesis_thread.joinable(),"native did not enter three lanes");
+        }
+        for(unsigned n=1;n<=8;++n) {
+            require(XR_SUCCEEDED(wait_for_synthesis_handoff(s)),"worker rendezvous");
+            // RE Village: releases need not be one-to-one with EndFrames.
+            // Exercise left-only, right-only, then both-eye double captures.
+            if(gap_test && (n==4 || n==6 || n==7)) {
+                auto extra=n==6 ? right : left;
+                fill(extra->enumerated_d3d12_images[0].Get(),230,200,array);release(extra);
+                if(n==7 && !array) {fill(right->enumerated_d3d12_images[0].Get(),230,200);release(right);}
+            }
+            if(!alternating_eyes || n==1 || n%2==0){fill(left->enumerated_d3d12_images[0].Get(),n,80,array);release(left);}
+            if(!array && (!alternating_eyes || n==1 || n%2==1)){fill(right->enumerated_d3d12_images[0].Get(),n,160);release(right);}
+            if(fsr_test && !fsr_missing) {
+                auto guides=std::make_shared<xrfg::DlssMotionVectorSet>();guides->eye_count=2;
+                for(unsigned eye=0;eye<2;++eye) {
+                    auto g=std::make_shared<xrfg::DlssMotionVectorFrame>();g->stream=eye+1;g->epoch=1;g->serial=n;g->previous_serial=n-1;
+                    g->producer_queue=s->d3d12_queue;g->output=left->enumerated_d3d12_images[0];g->output_slice=eye;
+                    g->motion_vectors=motion;g->depth=depth;g->output_width=g->depth_width=g->motion_width=256;
+                    g->output_height=g->depth_height=g->motion_height=128;g->frame_time_delta_ms=16.6667F;
+                    guides->eyes[eye]=std::move(g);
+                }
+                std::scoped_lock lock(left->mutex);left->last_released_motion_vectors=std::move(guides);
+            }
+            fill(dynamic->enumerated_d3d12_images[0].Get(),n,60);release(dynamic);
+            if(n==1){fill(fixed->enumerated_d3d12_images[0].Get(),55,120);release(fixed);}
+            XrFrameState prediction{XR_TYPE_FRAME_STATE};
+            require(XR_SUCCEEDED(layer_wait_frame_impl(s->handle,nullptr,&prediction)),"producer wait");
+            require(prediction.predictedDisplayPeriod==8333333,"native advertised period");
+            require(XR_SUCCEEDED(layer_begin_frame_impl(s->handle,nullptr)),"producer begin");
+            std::array<XrCompositionLayerProjectionView,2> views;
+            for(unsigned eye=0;eye<2;++eye) {
+                auto& v=views[eye];v={XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};v.pose.orientation.w=1;v.pose.position.y=float(n);
+                v.pose.position.x=eye?.032F:-.032F;v.fov={-.7F,.7F,.7F,-.7F};
+                v.subImage.swapchain=eye?right->handle:left->handle;v.subImage.imageArrayIndex=array?eye:0;v.subImage.imageRect.extent={256,128};
+            }
+            XrCompositionLayerProjection projection{XR_TYPE_COMPOSITION_LAYER_PROJECTION};projection.space=reinterpret_cast<XrSpace>(0x100);
+            projection.viewCount=2;projection.views=views.data();
+            std::array<XrCompositionLayerQuad,2> quads;
+            for(unsigned i=0;i<2;++i){auto& v=quads[i];v={XR_TYPE_COMPOSITION_LAYER_QUAD};v.pose.orientation.w=1;v.pose.position.y=float(n);
+                v.subImage.swapchain=i?fixed->handle:dynamic->handle;v.subImage.imageArrayIndex=i;v.subImage.imageRect.extent={256,128};}
+            const XrCompositionLayerBaseHeader* layers[]={reinterpret_cast<XrCompositionLayerBaseHeader*>(&projection),
+                reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[0]),reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[1])};
+            XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=prediction.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+            end.layerCount=promotion_test && !s->three_slot_director ? 1 : 3;end.layers=layers;
+            const unsigned independence_frame=fsr_test ? 0 : promotion_test ? 5 : 2;
+            if(n==independence_frame){hr(s->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&blocked_synthesis)),"test gate");
+                hr(s->d3d12_synthesis_queue->Wait(blocked_synthesis.Get(),1),"block synthesis");}
+            require(XR_SUCCEEDED(layer_end_frame_impl(s->handle,&end)),"actual EndFrame");
+            if(fsr_test) {
+                require(!s->presenter_start_requested,
+                    "FSR was queued for automatic presenter promotion");
+                require(!s->three_slot_director && !continuous_presenter_active(s),
+                    "FSR left its inline submission route");
+            }
+            if(gap_test && (n==4 || n==6 || n==7)) {
+                require(XR_SUCCEEDED(wait_for_synthesis_handoff(s)),"gap prime completed");
+                require(!left->frame_generation->synthesizer->has_capture_gap(*left->last_released_capture) &&
+                    !right->frame_generation->synthesizer->has_capture_gap(*right->last_released_capture),"both histories not re-anchored");
+                require(s->three_slot_director && XR_SUCCEEDED(s->presenter_failure),"gap stopped director");
+            }
+            if(promotion_test && n==3) {
+                require(s->three_slot_director && s->synthesis_thread.joinable(),"EndFrame did not promote");
+                require(promotion_gate_count==1,"deferred-copy promotion not exercised");
+                require(promotion_gate_released,"director started before delayed endpoint completed");
+                require(submissions.size()==5 && submissions.back()==std::pair<unsigned,bool>{3,false},"promotion skipped current endpoint");
+            }
+            if(n==independence_frame) {
+                // A blocked private GPU queue must not enqueue its wait on the
+                // application's GPU queue. A marker on that queue still completes.
+                ComPtr<ID3D12Fence> marker;hr(s->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&marker)),"marker");
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                hr(s->d3d12_queue->Signal(marker.Get(),1),"independent marker");
+                HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+                hr(marker->SetEventOnCompletion(1,event),"marker event");
+                const DWORD status=WaitForSingleObject(event,2000);CloseHandle(event);
+                hr(blocked_synthesis->Signal(1),"unblock synthesis");
+                require(status==WAIT_OBJECT_0,"application GPU queue blocked by synthesis");
+            }
+        }
+        require(XR_SUCCEEDED(wait_for_synthesis_handoff(s)),"final worker");
+        require(XR_SUCCEEDED(wait_for_presenter_idle(s)),"director drain");stop_continuous_presenter(s);
+        const unsigned expected_count=fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
+        require(submissions.size()==expected_count && waits==expected_count && begins==expected_count && ends==expected_count,"unique output/cycle count");
+        if(fsr_missing) {
+            for(unsigned i=0;i<8;++i) require(submissions[i]==std::pair<unsigned,bool>{i+1,false},"FSR missing guide repeated/lost real");
+        } else if(gap_test) {
+            std::vector<std::pair<unsigned,bool>> expected;
+            for(unsigned n=1;n<=8;++n) {
+                if(n>1 && n!=4 && n!=6 && n!=7) expected.emplace_back(n,true);
+                expected.emplace_back(n,false);
+            }
+            require(submissions==expected,"gap must skip only synthetic, keep every real, resume pairing");
+        } else if(promotion_test) {
+            const std::array<unsigned,8> real_positions={0,2,4,5,7,9,11,13};
+            unsigned next_real=0;
+            for(unsigned i=0;i<submissions.size();++i) {
+                if(next_real<real_positions.size() && i==real_positions[next_real]) {
+                    require(submissions[i]==std::pair<unsigned,bool>{next_real+1,false},"promotion real endpoint order");
+                    ++next_real;
+                } else require(submissions[i].second,"promotion synthetic order");
+            }
+        } else for(unsigned i=0;i<7;++i){require(submissions[2*i]==std::pair<unsigned,bool>{i+1,false},"real order");require(submissions[2*i+1].second,"synthetic order");}
+        require(submissions.back()==std::pair<unsigned,bool>{8,false},"last real");require(correct,"stale/cross-eye/auxiliary pixels");
+        if(fsr_test) {const auto stats=xrfg::fsr_frame_generation_statistics();
+            require(fsr_missing ? stats.attempts==0 : stats.used==7 && stats.failures==0,"FSR dispatch count/failed");}
+        for(auto& c:chains){drain_swapchain_gpu(c);destroy_frame_generation_swapchains(c);destroy_composition_capture(c);}
+        require(created==destroyed,"private XR swapchain leak");
+        ComPtr<ID3D12InfoQueue> info;
+        if(SUCCEEDED(s->d3d12_device.As(&info)))for(UINT64 i=0;i<info->GetNumStoredMessages();++i){SIZE_T size=0;info->GetMessage(i,nullptr,&size);
+            std::vector<unsigned char> bytes(size);auto* m=reinterpret_cast<D3D12_MESSAGE*>(bytes.data());info->GetMessage(i,m,&size);
+            if(m->Severity==D3D12_MESSAGE_SEVERITY_ERROR || m->Severity==D3D12_MESSAGE_SEVERITY_CORRUPTION){std::cerr<<m->pDescription<<'\n';correct=false;}}
+        require(correct,"D3D12 debug errors");
+        if(promotion_unblock.joinable())promotion_unblock.join();
+        promotion_gate.Reset();
+        std::cout<<"Native D3D12 "<<(array?"array":"split")<<": 8 real/"<<(expected_count-8)<<" synthetic; FSR="<<fsr_test<<"; delayed promotion="<<promotion_test<<"; private poisoned-source eyes + static/dynamic quads; independent GPU queue; no debug errors\n";
+        {std::scoped_lock lock(g_state_mutex);g_swapchains.clear();g_sessions.clear();}
+        chains.clear();left.reset();right.reset();dynamic.reset();fixed.reset();
+        // Release test-owned session/device before process-static layer globals.
+        // Keeping it global past their teardown invalidates driver lifetimes.
+        session_state.reset();
+        capture.verify(false, true);
+        return 0;
+    } catch(const std::exception& e) {
+        std::filesystem::path trace; std::wstring error;
+        xrfg::save_ram_timing(GetCurrentProcessId(),std::filesystem::current_path(),&trace,&error);
+        if(promotion_gate)promotion_gate->Signal(1);
+        if(promotion_unblock.joinable())promotion_unblock.join();
+        if(blocked_synthesis)blocked_synthesis->Signal(1);
+        if(session_state)stop_continuous_presenter(session_state);
+        for(auto& c:chains){drain_swapchain_gpu(c);destroy_frame_generation_swapchains(c);destroy_composition_capture(c);}
+        {std::scoped_lock lock(g_state_mutex);g_swapchains.clear();g_sessions.clear();}
+        chains.clear();images.clear();promotion_gate.Reset();blocked_synthesis.Reset();session_state.reset();
+        std::cerr<<e.what()<<'\n';return 1;
+    }
+}

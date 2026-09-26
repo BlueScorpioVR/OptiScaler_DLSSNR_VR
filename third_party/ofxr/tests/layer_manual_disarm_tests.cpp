@@ -3,6 +3,8 @@
 #undef main
 #include "xrfg/implicit_layer.hpp"
 #include <filesystem>
+#include <d3d12sdklayers.h>
+#include <dxgidebug.h>
 
 // Read the runtime-facing D3D11 textures, after publication/retirement, not the
 // D3D12 staging output or the independently submitted FPS quad.
@@ -61,6 +63,11 @@ int main(int argc, char** argv) {
         if (!value) throw std::runtime_error(message);
     };
     int result = 1;
+    const bool retain_failure = std::getenv("XRFG_TEST_KEEP_FAILURE") != nullptr;
+    if (retain_failure) {
+        ComPtr<ID3D12Debug> debug;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
+    }
     try {
         std::filesystem::create_directories(root);
         const auto dll = root / L"OptiScaler.dll";
@@ -73,7 +80,7 @@ int main(int argc, char** argv) {
         {
             std::ofstream ini(root / L"ofxr_bridge.ini");
             ini << "[ofxr]\nbackend=fidelityfx\ncontrol_event=" << ascii_control
-                << "\n[diagnostics]\nlogging_enabled=" << (marker_mode == "on" || marker_mode == "hidden" ? 1 : 0)
+                << "\n[diagnostics]\nlogging_enabled=" << (retain_failure || marker_mode == "on" || marker_mode == "hidden" ? 1 : 0)
                 << "\n[overlay]\nposition=" << (!marker_mode.empty() && marker_mode != "hidden" ? "upper_right" : "off") << '\n';
         }
         require(g_d3d11_interop_mode ? initialize_d3d11() : initialize_d3d12(), "initialize GPU fixture");
@@ -191,11 +198,19 @@ int main(int argc, char** argv) {
             XrFrameEndInfo e{XR_TYPE_FRAME_END_INFO};
             e.displayTime = time; e.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
             e.layerCount = 1; e.layers = &base;
-            require(XR_SUCCEEDED(end(session, &e)), "end frame");
+            // The layer runs its inline second cycle from inside this call;
+            // the fake runtime throttles that wait and not the application's.
+            g_application_in_end_frame.store(true, std::memory_order_release);
+            const XrResult end_result = end(session, &e);
+            g_application_in_end_frame.store(false, std::memory_order_release);
+            require(XR_SUCCEEDED(end_result), "end frame");
         };
         XrFrameState current{XR_TYPE_FRAME_STATE};
         require(XR_SUCCEEDED(wait(session, nullptr, &current)), "first wait");
-        for (int i = 0; i < 8; ++i) {
+        // One more warm-up frame than the promotion needs on its own: the frame
+        // that arms generation passes through, so the first pair - and the
+        // throttled inline cycle the promotion counts - is one frame later.
+        for (int i = 0; i < 9; ++i) {
             require(XR_SUCCEEDED(begin(session, nullptr)), "warmup begin");
             capture();
             XrFrameState next_frame{XR_TYPE_FRAME_STATE};
@@ -270,7 +285,7 @@ int main(int argc, char** argv) {
             require(wait_for_queue_idle(), "recovered GPU retirement");
         }
         require(g_synthetic_release_calls.load() > before_failure, "same-session recovery after backend failure");
-        require(GetPrivateProfileIntW(L"diagnostics", L"logging_enabled", 42, (root / L"ofxr_bridge.ini").c_str()) == 0,
+        require(GetPrivateProfileIntW(L"diagnostics", L"logging_enabled", 42, (root / L"ofxr_bridge.ini").c_str()) == (retain_failure ? 1 : 0),
             "menu preserves diagnostic flag");
 #endif
         if (!marker_mode.empty()) {
@@ -291,7 +306,20 @@ int main(int argc, char** argv) {
     if (module) FreeLibrary(module);
     if (signal) CloseHandle(signal);
     std::error_code ignored;
-    if (root.is_absolute() && root.filename().wstring().starts_with(L"ofxr-disarm-")) std::filesystem::remove_all(root, ignored);
+    if (retain_failure && result) {
+        std::cerr << "Evidence: " << root.string() << '\n';
+        ComPtr<IDXGIInfoQueue> info;
+        const GUID all{0xe48ae283,0xda80,0x490b,{0x87,0xe6,0x43,0xe9,0xa9,0xcf,0xda,0x08}};
+        if (SUCCEEDED(DXGIGetDebugInterface1(0,IID_PPV_ARGS(&info)))) {
+            for(UINT64 i=0;i<info->GetNumStoredMessages(all);++i) {
+                SIZE_T bytes{}; info->GetMessage(all,i,nullptr,&bytes);
+                std::vector<unsigned char> data(bytes);auto* m=reinterpret_cast<DXGI_INFO_QUEUE_MESSAGE*>(data.data());
+                if(SUCCEEDED(info->GetMessage(all,i,m,&bytes)) && m->Severity<=DXGI_INFO_QUEUE_MESSAGE_SEVERITY_ERROR)
+                    std::cerr << m->pDescription << '\n';
+            }
+        }
+    }
+    else if (root.is_absolute() && root.filename().wstring().starts_with(L"ofxr-disarm-")) std::filesystem::remove_all(root, ignored);
     if (!result) std::cout << "Live Disarm: " << mode << " passed\n";
     return result;
 }

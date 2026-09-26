@@ -47,7 +47,71 @@ namespace {
            _wcsnicmp(left.data(), right.data(), left.size()) == 0;
 }
 
+[[nodiscard]] HKEY registry_root(RegistryScope scope) noexcept {
+    return scope == RegistryScope::local_machine
+        ? HKEY_LOCAL_MACHINE
+        : HKEY_CURRENT_USER;
+}
+
 } // namespace
+
+RegistryScope registry_scope_for_integrity_rid(
+    std::uint32_t integrity_rid) noexcept {
+    return integrity_rid >= SECURITY_MANDATORY_HIGH_RID
+        ? RegistryScope::local_machine
+        : RegistryScope::current_user;
+}
+
+RegistryScope preferred_registry_scope() noexcept {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return RegistryScope::current_user;
+    }
+
+    DWORD size = 0;
+    static_cast<void>(GetTokenInformation(
+        token, TokenIntegrityLevel, nullptr, 0, &size));
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || size == 0) {
+        CloseHandle(token);
+        return RegistryScope::current_user;
+    }
+
+    try {
+        std::vector<BYTE> buffer(size);
+        if (!GetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                buffer.data(),
+                size,
+                &size)) {
+            CloseHandle(token);
+            return RegistryScope::current_user;
+        }
+        CloseHandle(token);
+        token = nullptr;
+
+        const auto* label =
+            reinterpret_cast<const TOKEN_MANDATORY_LABEL*>(buffer.data());
+        if (label->Label.Sid == nullptr || !IsValidSid(label->Label.Sid)) {
+            return RegistryScope::current_user;
+        }
+        const auto* count = GetSidSubAuthorityCount(label->Label.Sid);
+        if (count == nullptr || *count == 0) {
+            return RegistryScope::current_user;
+        }
+        const auto* rid = GetSidSubAuthority(label->Label.Sid, *count - 1U);
+        return rid == nullptr
+            ? RegistryScope::current_user
+            : registry_scope_for_integrity_rid(*rid);
+    } catch (...) {
+        if (token != nullptr) CloseHandle(token);
+        return RegistryScope::current_user;
+    }
+}
+
+std::wstring_view registry_scope_name(RegistryScope scope) noexcept {
+    return scope == RegistryScope::local_machine ? L"HKLM" : L"HKCU";
+}
 
 std::wstring arm_signal_name(const std::filesystem::path& manifest) {
     // Deterministic across tray/DLL versions; no user-controlled event name.
@@ -190,13 +254,14 @@ ConfiguredNvidiaOptions read_nvidia_options(
 
 bool register_manifest(
     const std::filesystem::path& manifest,
+    RegistryScope scope,
     std::wstring* error,
     std::wstring_view registry_subkey) noexcept {
     try {
         const std::wstring subkey(registry_subkey);
         HKEY key = nullptr;
         const LSTATUS create_status = RegCreateKeyExW(
-            HKEY_CURRENT_USER,
+            registry_root(scope),
             subkey.c_str(),
             0,
             nullptr,
@@ -240,13 +305,14 @@ bool register_manifest(
 
 bool unregister_manifest(
     const std::filesystem::path& manifest,
+    RegistryScope scope,
     std::wstring* error,
     std::wstring_view registry_subkey) noexcept {
     try {
         const std::wstring subkey(registry_subkey);
         HKEY key = nullptr;
         const LSTATUS open_status = RegOpenKeyExW(
-            HKEY_CURRENT_USER,
+            registry_root(scope),
             subkey.c_str(),
             0,
             KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY,
@@ -297,12 +363,13 @@ bool unregister_manifest(
 
 bool manifest_registered(
     const std::filesystem::path& manifest,
+    RegistryScope scope,
     std::wstring_view registry_subkey) noexcept {
     try {
         const std::wstring subkey(registry_subkey);
         HKEY key = nullptr;
         if (RegOpenKeyExW(
-                HKEY_CURRENT_USER,
+                registry_root(scope),
                 subkey.c_str(),
                 0,
                 KEY_QUERY_VALUE | KEY_WOW64_64KEY,
@@ -389,12 +456,13 @@ bool owned_registration_path(
 
 bool retire_manifest(
     const std::filesystem::path& manifest,
+    RegistryScope scope,
     std::wstring* error,
     std::wstring_view registry_subkey) noexcept {
     try {
         std::wstring signal_error;
         const bool signalled = signal_arm_stop(manifest, &signal_error);
-        if (!unregister_manifest(manifest, error, registry_subkey)) return false;
+        if (!unregister_manifest(manifest, scope, error, registry_subkey)) return false;
         if (!signalled) {
             if (error) *error = signal_error;
             return false;
@@ -420,6 +488,7 @@ bool retire_manifest(
 
 bool cleanup_owned_registrations(
     const std::filesystem::path& local_directory,
+    RegistryScope scope,
     std::wstring* error,
     std::wstring_view registry_subkey) noexcept {
     try {
@@ -435,7 +504,7 @@ bool cleanup_owned_registrations(
         std::vector<std::filesystem::path> manifests;
         HKEY key = nullptr;
         const std::wstring subkey(registry_subkey);
-        const auto opened = RegOpenKeyExW(HKEY_CURRENT_USER, subkey.c_str(), 0,
+        const auto opened = RegOpenKeyExW(registry_root(scope), subkey.c_str(), 0,
             KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key);
         if (opened == ERROR_SUCCESS) {
             // Snapshot names before deleting values so enumeration cannot skip.
@@ -503,20 +572,20 @@ bool cleanup_owned_registrations(
             std::wstring detail;
             if (!safe_parent) {
                 if (!signal_arm_stop(manifest, &detail)) fail(detail);
-                if (!unregister_manifest(manifest, &detail, registry_subkey)) fail(detail);
+                if (!unregister_manifest(manifest, scope, &detail, registry_subkey)) fail(detail);
                 const auto attributes = GetFileAttributesW(manifest.c_str());
                 const auto status = GetLastError();
                 if (attributes != INVALID_FILE_ATTRIBUTES ||
                     (status != ERROR_FILE_NOT_FOUND && status != ERROR_PATH_NOT_FOUND))
                     fail(L"OFXR manifest not removed through an unsafe cache directory: " + manifest.wstring());
-            } else if (!retire_manifest(manifest, &detail, registry_subkey)) {
+            } else if (!retire_manifest(manifest, scope, &detail, registry_subkey)) {
                 fail(detail);
             }
         }
         // Do not report Off if an owned registration survived or appeared while
         // cleanup was running. Values disabled with DWORD 1 count as leftovers too.
         key = nullptr;
-        const auto verified = RegOpenKeyExW(HKEY_CURRENT_USER, subkey.c_str(), 0,
+        const auto verified = RegOpenKeyExW(registry_root(scope), subkey.c_str(), 0,
             KEY_QUERY_VALUE | KEY_WOW64_64KEY, &key);
         if (verified == ERROR_SUCCESS) {
             std::vector<wchar_t> name(32768);

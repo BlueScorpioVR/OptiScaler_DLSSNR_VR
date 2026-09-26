@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <filesystem>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -22,6 +23,8 @@ int main() {
 
     const LauncherSettings release_defaults;
     const std::string default_runtime_ini = build_runtime_ini(release_defaults);
+    if (!contains(default_runtime_ini, "timing_capture=0") ||
+        contains(default_runtime_ini, "timing_capture=1")) return 1;
     if (release_defaults.overlay_position != xrfg::FpsOverlayPosition::upper_right ||
         !contains(default_runtime_ini, "[overlay]\r\nposition=upper_right")) return 1;
     for (auto position : {xrfg::FpsOverlayPosition::off, xrfg::FpsOverlayPosition::upper_left,
@@ -37,12 +40,56 @@ int main() {
         release_defaults.nvidia_input_scale != NvidiaInputScale::half ||
         release_defaults.nvidia_bidirectional || release_defaults.diagnostics ||
         !contains(default_runtime_ini, "[ofxr]\r\nbackend=fidelityfx") ||
+        !contains(default_runtime_ini, "motion_vectors=dlss") ||
         !contains(default_runtime_ini, "nvidia_preset=medium") ||
         !contains(default_runtime_ini, "nvidia_input_scale=50") ||
         !contains(default_runtime_ini, "[diagnostics]\r\nlogging_enabled=0")) {
         std::cerr << "release defaults failed\n";
         return 1;
     }
+
+    if (!contains(default_runtime_ini, "max_file_mb=32") ||
+        !contains(default_runtime_ini, "flush_each_event=0")) return 1;
+    const auto carried = build_runtime_ini(release_defaults, 128, true);
+    if (!contains(carried, "max_file_mb=128") ||
+        !contains(carried, "flush_each_event=1") ||
+        !contains(carried, "logging_enabled=0")) return 1;
+
+    // Isolated filesystem fixture: no live cache or registration is touched.
+    const auto fixture = std::filesystem::temp_directory_path() /
+        (L"ofxr-ini-migration-" + std::to_wstring(GetCurrentProcessId()) +
+         L"-" + std::to_wstring(GetTickCount64()));
+    const auto destination = fixture / L"v213" / L"ofxr_bridge.ini";
+    auto read = read_runtime_diagnostic_settings(destination);
+    if (read.max_file_mb != 32 || read.flush_each_event) return 1;
+    std::filesystem::create_directories(fixture / L"v211");
+    std::filesystem::create_directories(fixture / L"v212");
+    std::filesystem::create_directories(destination.parent_path());
+    {
+        std::ofstream old(fixture / L"v211" / L"ofxr_bridge.ini");
+        old << "[diagnostics]\nmax_file_mb=64\nflush_each_event=0\n";
+        std::ofstream recent(fixture / L"v212" / L"ofxr_bridge.ini");
+        recent << "[diagnostics]\nmax_file_mb=128\nflush_each_event=1\nlogging_enabled=1\n";
+    }
+    std::filesystem::last_write_time(fixture / L"v211" / L"ofxr_bridge.ini",
+        std::filesystem::file_time_type::clock::now() - std::chrono::hours(1));
+    read = read_runtime_diagnostic_settings(destination);
+    if (read.max_file_mb != 128 || !read.flush_each_event ||
+        !contains(build_runtime_ini(release_defaults, read.max_file_mb,
+            read.flush_each_event), "logging_enabled=0")) return 1;
+    {
+        std::ofstream current(destination);
+        current << "[diagnostics]\nmax_file_mb=96\nflush_each_event=0\n";
+    }
+    read = read_runtime_diagnostic_settings(destination);
+    if (read.max_file_mb != 96 || read.flush_each_event) return 1;
+    {
+        std::ofstream current(destination);
+        current << "[diagnostics]\nlogging_enabled=1\n";
+    }
+    read = read_runtime_diagnostic_settings(destination);
+    if (read.max_file_mb != 32 || read.flush_each_event) return 1;
+    std::filesystem::remove_all(fixture);
 
     LauncherSettings settings;
     settings.backend = FlowBackend::nvidia;
@@ -76,6 +123,7 @@ int main() {
     }
 
     const std::string runtime_ini = build_runtime_ini(settings);
+    if (!contains(runtime_ini, "timing_capture=0")) return 1; // also with normal logging ON
     if (!contains(runtime_ini, "[ofxr]\r\nbackend=nvidia") ||
         !contains(runtime_ini, "nvidia_preset=slow") ||
         !contains(runtime_ini, "nvidia_input_scale=50") ||
@@ -109,17 +157,24 @@ int main() {
         std::to_wstring(GetTickCount64());
     std::wstring registry_error;
     const bool registered = xrfg::implicit_layer::register_manifest(
-        implicit_manifest, &registry_error, test_subkey);
+        implicit_manifest, xrfg::implicit_layer::RegistryScope::current_user,
+        &registry_error, test_subkey);
     const bool visible_before_probe =
-        xrfg::implicit_layer::manifest_registered(implicit_manifest, test_subkey);
+        xrfg::implicit_layer::manifest_registered(
+            implicit_manifest, xrfg::implicit_layer::RegistryScope::current_user,
+            test_subkey);
     // V017 deliberately has no loader-negotiation consumption path: repeated
     // OpenXR probes must leave the manual arm untouched until tray disarm.
     const bool visible_after_probe =
-        xrfg::implicit_layer::manifest_registered(implicit_manifest, test_subkey);
+        xrfg::implicit_layer::manifest_registered(
+            implicit_manifest, xrfg::implicit_layer::RegistryScope::current_user,
+            test_subkey);
     const bool unregistered = xrfg::implicit_layer::unregister_manifest(
-        implicit_manifest, &registry_error, test_subkey);
+        implicit_manifest, xrfg::implicit_layer::RegistryScope::current_user,
+        &registry_error, test_subkey);
     const bool removed = !xrfg::implicit_layer::manifest_registered(
-        implicit_manifest, test_subkey);
+        implicit_manifest, xrfg::implicit_layer::RegistryScope::current_user,
+        test_subkey);
     static_cast<void>(RegDeleteKeyW(HKEY_CURRENT_USER, test_subkey.c_str()));
     static_cast<void>(RegDeleteKeyW(
         HKEY_CURRENT_USER, L"Software\\OFXRBridgeTest"));

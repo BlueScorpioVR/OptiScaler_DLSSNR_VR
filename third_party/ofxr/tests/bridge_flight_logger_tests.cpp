@@ -3,11 +3,17 @@
 #include <windows.h>
 
 #include <array>
+#include <atomic>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <sstream>
+#include <thread>
+#include <unordered_set>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -48,13 +54,84 @@ struct TempDirectory {
     }
 };
 
+void concurrent_records(const fs::path& directory, bool wrap, bool flush) {
+    fs::create_directories(directory);
+    write(directory / "ofxr_bridge.ini", std::string("[diagnostics]\r\n") +
+        "logging_enabled=1\r\nmax_file_mb=" + (wrap ? "1" : "8") +
+        "\r\nflush_each_event=" + (flush ? "1" : "0") + "\r\n");
+    xrfg::BridgeFlightLogger logger;
+    logger.initialize(directory);
+    require(logger.enabled(), "concurrent logger did not initialize");
+    const auto path = logger.log_path();
+    constexpr unsigned threads = 8;
+    const unsigned iterations = wrap ? 12000 : flush ? 32 : 1500;
+    std::atomic<unsigned> ready{};
+    std::atomic<bool> start{};
+    std::vector<std::thread> writers;
+    for (unsigned t = 0; t < threads; ++t) {
+        writers.emplace_back([&, t] {
+            ready.fetch_add(1);
+            while (!start.load()) std::this_thread::yield();
+            for (unsigned i = 0; i < iterations; ++i) {
+                logger.event(xrfg::BridgeFlightOperation::synthesis_pair, 123,
+                    t, i, static_cast<std::uint64_t>(t) * iterations + i);
+            }
+        });
+    }
+    while (ready.load() != threads) std::this_thread::yield();
+    start.store(true);
+    for (auto& writer : writers) writer.join();
+    // Written after joining: it must survive even if the last writer wrapped.
+    logger.event(xrfg::BridgeFlightOperation::application_wait_frame, 456);
+    logger.shutdown();
+    const auto contents = read(path);
+    require(contents.size() <= (wrap ? 1u : 8u) * 1024 * 1024,
+        "concurrent logger exceeded file size cap");
+    require(contents.find('\0') == std::string::npos, "holes in positioned log");
+    require(contents.ends_with("\r\n"), "partial trailing record");
+    require(contents.find("op=app_wait_frame result=456") != std::string::npos,
+        "final event missing after concurrent writes");
+    require(contents.find("op=logger result=0") != std::string::npos,
+        "shutdown event missing after concurrent writes");
+    std::unordered_set<unsigned long long> sequences, identities;
+    std::istringstream lines(contents);
+    std::string line;
+    while (std::getline(lines, line)) {
+        unsigned long long seq{}, duration{}, a{}, b{}, c{};
+        double ms{};
+        unsigned long tid{};
+        char phase{}, operation[64]{};
+        long long result{};
+        int consumed{};
+        const int fields = std::sscanf(line.c_str(),
+            "seq=%llu ms=%lf tid=%lu phase=%c op=%63s result=%lld dur_us=%llu "
+            "a=%llu b=%llu c=%llu%n", &seq, &ms, &tid, &phase, operation,
+            &result, &duration, &a, &b, &c, &consumed);
+        require(fields == 10 && line.substr(consumed) == "\r",
+            "torn, overlapping or malformed concurrent log record");
+        require(sequences.insert(seq).second, "duplicated record sequence");
+        if (std::string(operation) == "synthesis_pair") {
+            require(result == 123 && phase == 'I' && duration == 0 &&
+                a < threads && b < iterations && c == a * iterations + b,
+                "concurrent event payload corrupted");
+            require(identities.insert(c).second, "duplicated event payload");
+        }
+    }
+    require(!identities.empty(), "concurrent log lost all worker records");
+    if (!wrap) require(identities.size() == threads * iterations &&
+        sequences.size() == threads * iterations + 3,
+        "non-wrapping logger lost records");
+    if (wrap) require(identities.size() < threads * iterations,
+        "wrap fixture did not exercise truncation");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc == 2) {
         xrfg::BridgeFlightLogger child;
         child.initialize(argv[1]);
-        child.event(xrfg::BridgeFlightOperation::gpu_fence_snapshot, 6, 11, 22, 33);
+        child.event(xrfg::BridgeFlightOperation::application_wait_frame, 6, 11, 22, 33);
         TerminateProcess(GetCurrentProcess(), 73);
         return 1;
     }
@@ -96,10 +173,10 @@ int main(int argc, char** argv) {
         for (const auto& item : fs::directory_iterator(enabled_directory)) {
             if (item.path().extension() == ".log") {
                 persisted |= read(item.path()).find(
-                    "op=gpu_fence_snapshot result=6 dur_us=0 a=11 b=22 c=33") != std::string::npos;
+                    "op=app_wait_frame result=6 dur_us=0 a=11 b=22 c=33") != std::string::npos;
             }
         }
-        require(persisted, "last GPU breadcrumb lost after forced termination");
+        require(persisted, "last recorder event lost after forced termination");
 
         xrfg::BridgeFlightLogger enabled;
         enabled.initialize(enabled_directory);
@@ -140,6 +217,21 @@ int main(int argc, char** argv) {
             xrfg::BridgeFlightOperation::presenter_submission,
             0);
         enabled.event(
+            xrfg::BridgeFlightOperation::presenter_source,
+            0, 17, 123456, 17);
+        enabled.event(
+            xrfg::BridgeFlightOperation::presenter_clock_anchor,
+            0, 123456, 234567, 10000000);
+        enabled.event(
+            xrfg::BridgeFlightOperation::presenter_clock_capability,
+            1, 1, 1, 0);
+        enabled.event(
+            xrfg::BridgeFlightOperation::presenter_queue_drop,
+            2, 1, 1, 0);
+        enabled.event(
+            xrfg::BridgeFlightOperation::three_slot_buffer_wait,
+            0, 1234, 16666666, 0);
+        enabled.event(
             xrfg::BridgeFlightOperation::nvidia_gpu_stages,
             2,
             101,
@@ -170,6 +262,19 @@ int main(int argc, char** argv) {
                 log.find("op=presenter_submission result=0") !=
                     std::string::npos,
             "bridge log is missing V043 presenter event names");
+        require(log.find("op=presenter_queue_drop result=2 dur_us=0 a=1 b=1") !=
+                    std::string::npos,
+            "bridge log is missing latest-frame drop evidence");
+        require(log.find("op=presenter_source result=0 dur_us=0 a=17 b=123456 c=17") !=
+                    std::string::npos &&
+                log.find("op=presenter_clock_anchor result=0 dur_us=0 a=123456 b=234567 c=10000000") !=
+                    std::string::npos &&
+                log.find("op=presenter_clock_capability result=1 dur_us=0 a=1 b=1") !=
+                    std::string::npos,
+            "bridge log is missing presenter deadline correlation fields");
+        require(log.find("op=three_slot_buffer_wait result=0 dur_us=0 a=1234 b=16666666") !=
+                    std::string::npos,
+            "bridge log is missing three-slot handoff evidence");
         require(
             log.find(
                 "op=nvidia_gpu_stages result=2 dur_us=0 a=101 b=202 c=303") !=
@@ -178,6 +283,10 @@ int main(int argc, char** argv) {
                     "op=nvidia_gpu_total result=0 dur_us=0 a=404 b=1010 c=77") !=
                     std::string::npos,
             "bridge log is missing V049 NVIDIA GPU timing fields");
+
+        concurrent_records(temporary.path / "concurrent", false, false);
+        concurrent_records(temporary.path / "wrap", true, false);
+        concurrent_records(temporary.path / "flush", false, true);
 
         std::cout << "Bridge flight logger tests passed.\n";
         return 0;

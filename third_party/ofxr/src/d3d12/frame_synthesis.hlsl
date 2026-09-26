@@ -27,16 +27,32 @@ cbuffer SynthesisParameters : register(b0) {
     uint FlowWidth;
     uint FlowHeight;
     uint FlowBlockSize;
-    uint Slice;
-    uint RepeatedCapture;
     uint ViewIndex;
-    CameraMapping PreviousMappings[2];
     uint UseGameMotion;
+    uint GameMotionPadding;
     float4 GameMotionRect;
     float2 GameMotionScale;
     float2 GameMotionJitterDelta;
-    uint GameMotionPadding;
+    CameraMapping PreviousMappings[2];
+    uint Slice;
+    // Bit 0 is the repeated-capture flag. Bits 8-23 carry the synthetic's
+    // position between the two captures in 1/65535ths - 0 at the previous
+    // capture, 1 at the current. They share a slot because the root signature
+    // is full: 62 constants plus two descriptor tables is the whole 64-DWORD
+    // budget, leaving no room for a 63rd.
+    uint SynthesisFlags;
 };
+
+uint repeated_capture_flag() {
+    return SynthesisFlags & 1u;
+}
+
+// An unset field decodes to 0.5, which is the fixed midpoint this shader
+// used before the layer began deriving it.
+float synthesis_fraction() {
+    uint packed = (SynthesisFlags >> 8) & 0xffffu;
+    return packed == 0u ? 0.5 : float(packed) / 65535.0;
+}
 
 float3 rotate_by_quaternion(float4 quaternion, float3 input_vector) {
     return input_vector + 2.0 * cross(
@@ -102,6 +118,61 @@ MappedCoordinate map_target_to_source(
     return output;
 }
 
+MappedCoordinate map_source_to_target(
+    float2 source_coordinate,
+    CameraMapping mapping) {
+    MappedCoordinate output;
+    output.coordinate = float2(0.0, 0.0);
+    output.valid = 0.0;
+    output.padding = 0.0;
+    float2 source_minimum = mapping.SourceRect.xy;
+    float2 source_extent = mapping.SourceRect.zw;
+    float2 source_maximum = source_minimum + source_extent - 1.0;
+    bool source_inside =
+        source_coordinate.x >= source_minimum.x &&
+        source_coordinate.y >= source_minimum.y &&
+        source_coordinate.x <= source_maximum.x &&
+        source_coordinate.y <= source_maximum.y;
+
+    float2 source_uv =
+        (source_coordinate - source_minimum + 0.5) / source_extent;
+    float2 source_tangent = float2(
+        lerp(mapping.SourceTangents.x, mapping.SourceTangents.y, source_uv.x),
+        lerp(mapping.SourceTangents.z, mapping.SourceTangents.w, source_uv.y));
+    float3 source_ray = float3(source_tangent, -1.0);
+    float4 source_to_target_rotation = float4(
+        -mapping.TargetToSourceRotation.xyz,
+        mapping.TargetToSourceRotation.w);
+    float3 target_ray = rotate_by_quaternion(
+        source_to_target_rotation,
+        source_ray);
+    bool target_in_front = target_ray.z < -1.0e-5;
+    float inverse_depth = 1.0 / max(-target_ray.z, 1.0e-5);
+    float2 target_tangent = target_ray.xy * inverse_depth;
+    float target_width = mapping.TargetTangents.y - mapping.TargetTangents.x;
+    float target_height = mapping.TargetTangents.w - mapping.TargetTangents.z;
+    bool valid_fov = target_width > 1.0e-7 && abs(target_height) > 1.0e-7;
+    target_width = max(target_width, 1.0e-7);
+    target_height = target_height < 0.0
+                        ? min(target_height, -1.0e-7)
+                        : max(target_height, 1.0e-7);
+    float2 target_uv = float2(
+        (target_tangent.x - mapping.TargetTangents.x) / target_width,
+        (target_tangent.y - mapping.TargetTangents.z) / target_height);
+    float2 target_minimum = mapping.TargetRect.xy;
+    float2 target_extent = mapping.TargetRect.zw;
+    float2 target_maximum = target_minimum + target_extent;
+    output.coordinate = target_minimum + target_uv * target_extent - 0.5;
+    output.valid = source_inside && target_in_front && valid_fov &&
+        output.coordinate.x >= target_minimum.x - 0.5 &&
+        output.coordinate.y >= target_minimum.y - 0.5 &&
+        output.coordinate.x <= target_maximum.x - 0.5 &&
+        output.coordinate.y <= target_maximum.y - 0.5
+            ? 1.0
+            : 0.0;
+    return output;
+}
+
 float4 bilinear_previous_source(float2 coordinate, uint slice) {
     float2 bounded = clamp(
         coordinate,
@@ -144,16 +215,21 @@ float4 bilinear_current_source(float2 coordinate, uint slice) {
     return lerp(top, bottom, fraction.y);
 }
 
-float2 nvidia_flow_input_scale() {
-    return min(
-        float2(1.0, 1.0),
-        float2(float(PackedWidth), float(PackedHeight)) /
-            max(float2(float(Width), float(Height)), float2(1.0, 1.0)));
+// The ratio the flow input was packed at, relative to the source image.
+// One when the input is full resolution. Derived from the width alone and
+// applied to both axes: the scale is uniform, and the packed height carries
+// the stacked eyes on the FidelityFX path, so a height ratio would not
+// describe it.
+float2 flow_input_scale() {
+    float ratio = min(
+        1.0,
+        float(PackedWidth) / max(float(Width), 1.0));
+    return float2(ratio, ratio);
 }
 
-float2 nvidia_flow_input_coordinate(float2 full_resolution_coordinate) {
+float2 flow_input_coordinate(float2 full_resolution_coordinate) {
     return (full_resolution_coordinate + 0.5) *
-        nvidia_flow_input_scale() - 0.5;
+        flow_input_scale() - 0.5;
 }
 
 struct CameraSample {
@@ -211,7 +287,22 @@ void PackFlowInput(uint3 thread_id : SV_DispatchThreadID) {
     float4 current_color = float4(0.0, 0.0, 0.0, 1.0);
     uint slice = thread_id.y / PackedEyeStride;
     uint local_y = thread_id.y - slice * PackedEyeStride;
-    if (thread_id.x < Width && slice < ArraySize && local_y < Height) {
+    // A reduced input is resampled rather than point-sampled, so the flow
+    // sees a filtered image instead of every fourth pixel.
+    float2 input_scale = flow_input_scale();
+    if (slice >= ArraySize) {
+        PackedColor[thread_id.xy] = saturate(current_color);
+        return;
+    }
+    if (PackedWidth < Width) {
+        float2 source_coordinate =
+            (float2(float(thread_id.x), float(local_y)) + 0.5) /
+                max(input_scale, float2(1.0e-6, 1.0e-6)) - 0.5;
+        if (source_coordinate.y < float(Height)) {
+            current_color =
+                bilinear_current_source(source_coordinate, slice);
+        }
+    } else if (thread_id.x < Width && local_y < Height) {
         current_color = CurrentFrame.Load(
             int4(int2(thread_id.x, local_y), int(slice), 0));
     }
@@ -230,7 +321,7 @@ void PackNvidiaFlowInput(uint3 thread_id : SV_DispatchThreadID) {
     bool downscaled = PackedWidth < Width || PackedHeight < Height;
     if (slice < ArraySize && downscaled) {
         float2 source_coordinate =
-            (float2(thread_id.xy) + 0.5) / nvidia_flow_input_scale() - 0.5;
+            (float2(thread_id.xy) + 0.5) / flow_input_scale() - 0.5;
         previous_color = bilinear_previous_source(source_coordinate, slice);
         current_color = bilinear_current_source(source_coordinate, slice);
     } else if (thread_id.x < Width && slice < ArraySize &&
@@ -265,12 +356,13 @@ struct FlowGridBounds {
 
 FlowGridBounds flow_grid_bounds(
     float4 image_rect,
-    uint slice,
-    bool use_nvidia_input_scale) {
+    uint slice) {
     uint2 image_minimum = uint2(image_rect.xy);
     uint2 image_maximum = image_minimum + uint2(image_rect.zw) - 1U;
-    if (use_nvidia_input_scale) {
-        float2 input_scale = nvidia_flow_input_scale();
+    // Always applied: the scale is one when the input is full resolution,
+    // so this is the identity on an unscaled path.
+    {
+        float2 input_scale = flow_input_scale();
         uint2 scaled_minimum = uint2(floor(
             float2(image_minimum) * input_scale));
         uint2 scaled_end = uint2(ceil(
@@ -297,18 +389,18 @@ float2 flow_for_pixel(
     uint view_index,
     float value_scale,
     bool use_nvidia_input_scale) {
+    // The stride is zero where the backend packs eyes separately, so this
+    // is the scaled coordinate on that path and the scaled coordinate plus
+    // the eye offset on the stacked one.
+    float2 scaled = flow_input_coordinate(pixel);
     float2 packed_coordinate = float2(
-        pixel.x,
-        pixel.y + float(slice * PackedEyeStride));
-    if (use_nvidia_input_scale) {
-        packed_coordinate = nvidia_flow_input_coordinate(pixel);
-    }
+        scaled.x,
+        scaled.y + float(slice * PackedEyeStride));
     float2 flow_coordinate =
         (packed_coordinate + 0.5) / float(FlowBlockSize) - 0.5;
     FlowGridBounds bounds = flow_grid_bounds(
         PreviousMappings[view_index].TargetRect,
-        slice,
-        use_nvidia_input_scale);
+        slice);
     float2 bounded = clamp(
         flow_coordinate,
         float2(bounds.minimum),
@@ -337,9 +429,8 @@ float2 flow_for_pixel(
             bounds.maximum),
         fraction.x);
     float2 result = lerp(top, bottom, fraction.y) * value_scale;
-    if (use_nvidia_input_scale) {
-        result /= max(nvidia_flow_input_scale(), float2(1.0e-6, 1.0e-6));
-    }
+    // Flow measured on a reduced input has proportionally smaller vectors.
+    result /= max(flow_input_scale(), float2(1.0e-6, 1.0e-6));
     float magnitude = length(result);
     return magnitude > 512.0 ? result * (512.0 / magnitude) : result;
 }
@@ -349,14 +440,13 @@ float2 forward_flow_for_pixel(
     uint slice,
     uint view_index,
     float value_scale) {
-    float2 input_scale = nvidia_flow_input_scale();
-    float2 packed_coordinate = nvidia_flow_input_coordinate(pixel);
+    float2 input_scale = flow_input_scale();
+    float2 packed_coordinate = flow_input_coordinate(pixel);
     float2 flow_coordinate =
         (packed_coordinate + 0.5) / float(FlowBlockSize) - 0.5;
     FlowGridBounds bounds = flow_grid_bounds(
         PreviousMappings[view_index].SourceRect,
-        slice,
-        true);
+        slice);
     float2 bounded = clamp(
         flow_coordinate,
         float2(bounds.minimum),
@@ -401,22 +491,34 @@ float2 game_motion_for_pixel(float2 pixel, uint slice, uint view_index) {
     float2 coordinate = GameMotionRect.xy + uv * GameMotionRect.zw - 0.5;
     float2 minimum = GameMotionRect.xy;
     float2 maximum = GameMotionRect.xy + GameMotionRect.zw - 1.0;
-    int2 texel = int2(round(clamp(coordinate, minimum, maximum)));
+    float2 bounded = clamp(coordinate, minimum, maximum);
+    int2 top_left = int2(floor(bounded));
+    int2 bottom_right = min(top_left + int2(1, 1), int2(maximum));
+    float2 fraction = bounded - float2(top_left);
     // Each descriptor block owns one eye's independent mono DLSS resource.
-    float2 raw = GameMotionVectors.Load(int4(texel, 0, 0));
+    // Rotation produces a spatially varying field, so nearest-neighbour lookup
+    // creates an avoidable endpoint error that uniform translation conceals.
+    float2 top = lerp(
+        GameMotionVectors.Load(int4(top_left, 0, 0)),
+        GameMotionVectors.Load(int4(bottom_right.x, top_left.y, 0, 0)),
+        fraction.x);
+    float2 bottom = lerp(
+        GameMotionVectors.Load(int4(top_left.x, bottom_right.y, 0, 0)),
+        GameMotionVectors.Load(int4(bottom_right, 0, 0)),
+        fraction.x);
+    float2 raw = lerp(top, bottom, fraction.y);
     float2 result = raw * GameMotionScale + GameMotionJitterDelta;
     float magnitude = length(result);
     return magnitude > 512.0 ? result * (512.0 / magnitude) : result;
 }
 
 float nvidia_cost_for_pixel(float2 pixel, uint slice, uint view_index) {
-    float2 packed_coordinate = nvidia_flow_input_coordinate(pixel);
+    float2 packed_coordinate = flow_input_coordinate(pixel);
     int2 coordinate = int2(round(
         (packed_coordinate + 0.5) / float(FlowBlockSize) - 0.5));
     FlowGridBounds bounds = flow_grid_bounds(
         PreviousMappings[view_index].TargetRect,
-        slice,
-        true);
+        slice);
     return float(FlowAuxiliary.Load(int3(clamp(
         coordinate,
         bounds.minimum,
@@ -427,13 +529,12 @@ float nvidia_forward_cost_for_pixel(
     float2 pixel,
     uint slice,
     uint view_index) {
-    float2 packed_coordinate = nvidia_flow_input_coordinate(pixel);
+    float2 packed_coordinate = flow_input_coordinate(pixel);
     int2 coordinate = int2(round(
         (packed_coordinate + 0.5) / float(FlowBlockSize) - 0.5));
     FlowGridBounds bounds = flow_grid_bounds(
         PreviousMappings[view_index].SourceRect,
-        slice,
-        true);
+        slice);
     return float(ForwardAuxiliary.Load(int3(clamp(
         coordinate,
         bounds.minimum,
@@ -508,28 +609,13 @@ FullscreenVertex FullscreenTriangleVS(uint vertex_id : SV_VertexID) {
     return output;
 }
 
-// FSR produces the temporal midpoint in the camera plane of its latest input.
-// OFXR then performs only the remaining OpenXR midpoint-to-target rotation.
-float4 ReprojectGeneratedPS(FullscreenVertex input) : SV_Target {
-    uint2 integer_pixel = uint2(input.position.xy);
-    if (integer_pixel.x >= Width || integer_pixel.y >= Height ||
-        Slice >= ArraySize) {
-        return float4(0.0, 0.0, 0.0, 1.0);
-    }
-    const float2 pixel = float2(integer_pixel);
-    CameraSample generated = sample_previous_target(pixel, Slice, ViewIndex);
-    if (generated.valid >= 0.5) {
-        return saturate(generated.color);
-    }
-    return saturate(sample_current_target(pixel, Slice, ViewIndex).color);
-}
-
 float4 synthesize_midpoint(
     FullscreenVertex input,
     float flow_value_scale,
     bool use_nvidia_cost,
     bool use_nvidia_bidirectional,
-    bool validate_fast) {
+    bool validate_fast,
+    bool use_game_motion_pipeline) {
     float4 output_color = float4(0.0, 0.0, 0.0, 1.0);
     uint2 integer_pixel = uint2(input.position.xy);
     bool in_bounds = integer_pixel.x < Width && integer_pixel.y < Height &&
@@ -544,59 +630,100 @@ float4 synthesize_midpoint(
         MappedCoordinate previous_coverage = map_target_to_source(
             pixel,
             PreviousMappings[ViewIndex]);
-        bool scene_changed = RepeatedCapture == 0 && UseGameMotion == 0 && !use_nvidia_cost &&
+        bool scene_changed = repeated_capture_flag() == 0 && !use_game_motion_pipeline &&
+            !use_nvidia_cost &&
             (FlowAuxiliary.Load(int3(1, 0, 0)) & 0x0fU) != 0;
         if (previous_coverage.valid >= 0.5 && !scene_changed) {
-            bool preserve_stationary = validate_fast && RepeatedCapture == 0 &&
+            bool preserve_stationary = validate_fast && repeated_capture_flag() == 0 &&
                 current_fallback.valid >= 0.5 &&
                 fast_stationary_patch(pixel, Slice, current_fallback.color);
             if (preserve_stationary) {
-                output_color = saturate(0.5 * (current_fallback.color +
-                    sample_previous_target(pixel, Slice, ViewIndex).color));
+                output_color = saturate(lerp(
+                    sample_previous_target(pixel, Slice, ViewIndex).color,
+                    current_fallback.color,
+                    synthesis_fraction()));
             } else {
-                // The raw B-to-A flow includes head rotation. The OpenXR mapping
-                // supplies that camera component, leaving residual scene motion.
-                float2 raw_backward = RepeatedCapture != 0
-                    ? float2(0.0, 0.0)
-                    : UseGameMotion != 0
-                    ? game_motion_for_pixel(pixel, Slice, ViewIndex)
-                    : flow_for_pixel(
-                        pixel,
+                float2 raw_backward = float2(0.0, 0.0);
+                CameraSample previous_sample = (CameraSample)0;
+                CameraSample current_sample = (CameraSample)0;
+                bool endpoints_valid = true;
+                if (use_game_motion_pipeline) {
+                    // A B-to-A vector is attached to its B endpoint. Sampling
+                    // it once at the desired midpoint is exact only for a
+                    // constant translation field. Yaw is spatially varying:
+                    // solve cB = midpoint - 0.5 * (cA(cB) - cB), while mapping
+                    // cA through the previous OpenXR camera exactly.
+                    float2 current_endpoint = pixel;
+                    MappedCoordinate previous_endpoint;
+                    [unroll] for (uint iteration = 0; iteration < 3; ++iteration) {
+                        raw_backward = repeated_capture_flag() != 0
+                            ? float2(0.0, 0.0)
+                            : game_motion_for_pixel(
+                                current_endpoint, Slice, ViewIndex);
+                        previous_endpoint = map_source_to_target(
+                            current_endpoint + raw_backward,
+                            PreviousMappings[ViewIndex]);
+                        if (previous_endpoint.valid < 0.5) {
+                            endpoints_valid = false;
+                            break;
+                        }
+                        float2 target_displacement =
+                            previous_endpoint.coordinate - current_endpoint;
+                        current_endpoint =
+                            pixel - (1.0 - synthesis_fraction()) * target_displacement;
+                    }
+                    if (endpoints_valid) {
+                        raw_backward = repeated_capture_flag() != 0
+                            ? float2(0.0, 0.0)
+                            : game_motion_for_pixel(
+                                current_endpoint, Slice, ViewIndex);
+                        previous_endpoint = map_source_to_target(
+                            current_endpoint + raw_backward,
+                            PreviousMappings[ViewIndex]);
+                        endpoints_valid = previous_endpoint.valid >= 0.5;
+                    }
+                    if (endpoints_valid) {
+                        previous_sample = sample_previous_target(
+                            previous_endpoint.coordinate, Slice, ViewIndex);
+                        current_sample = sample_current_target(
+                            current_endpoint, Slice, ViewIndex);
+                    }
+                } else {
+                    raw_backward = repeated_capture_flag() != 0
+                        ? float2(0.0, 0.0)
+                        : flow_for_pixel(
+                            pixel,
+                            Slice,
+                            ViewIndex,
+                            flow_value_scale,
+                            use_nvidia_cost);
+                    float2 pose_backward = previous_coverage.coordinate - pixel;
+                    float2 residual_backward = raw_backward - pose_backward;
+                    previous_sample = sample_previous_target(
+                        pixel + residual_backward * synthesis_fraction(), Slice, ViewIndex);
+                    current_sample = sample_current_target(
+                        pixel - residual_backward * (1.0 - synthesis_fraction()),
                         Slice,
-                        ViewIndex,
-                        flow_value_scale,
-                        use_nvidia_cost);
-                float2 pose_backward = previous_coverage.coordinate - pixel;
-                // Optical flow observes the final images, including the OpenXR
-                // pose. DLSS game vectors are produced before that injected pose
-                // and already describe only game/object motion.
-                float2 residual_backward = UseGameMotion != 0
-                    ? raw_backward
-                    : raw_backward - pose_backward;
-                CameraSample previous_sample = sample_previous_target(
-                    pixel + residual_backward * 0.5,
-                    Slice,
-                    ViewIndex);
-                CameraSample current_sample = sample_current_target(
-                    pixel - residual_backward * 0.5,
-                    Slice,
-                    ViewIndex);
-                if (previous_sample.valid >= 0.5 && current_sample.valid >= 0.5) {
-                    float4 flow_midpoint = 0.5 * (
-                        previous_sample.color + current_sample.color);
+                        ViewIndex);
+                }
+                if (endpoints_valid) {
+                    if (previous_sample.valid >= 0.5 && current_sample.valid >= 0.5) {
+                    float4 flow_midpoint = lerp(
+                        previous_sample.color, current_sample.color, synthesis_fraction());
                     float disagreement = max(
                         abs(previous_sample.color.r - current_sample.color.r),
                         max(
                             abs(previous_sample.color.g - current_sample.color.g),
                             abs(previous_sample.color.b - current_sample.color.b)));
                     float confidence = saturate(1.0 - disagreement * 6.0);
-                    float4 stable_midpoint = 0.5 * (
-                        sample_previous_target(pixel, Slice, ViewIndex).color +
-                        current_fallback.color);
+                    float4 stable_midpoint = lerp(
+                        sample_previous_target(pixel, Slice, ViewIndex).color,
+                        current_fallback.color,
+                        synthesis_fraction());
                     if (use_nvidia_cost) {
                         float consistency_confidence = 1.0;
                         float cost_confidence = 1.0;
-                        if (RepeatedCapture == 0) {
+                        if (repeated_capture_flag() == 0) {
                             if (validate_fast) {
                                 confidence *= fast_endpoint_confidence(pixel, raw_backward, Slice);
                             }
@@ -648,6 +775,7 @@ float4 synthesize_midpoint(
                             flow_midpoint,
                             confidence));
                     }
+                    }
                 }
             }
         }
@@ -656,25 +784,43 @@ float4 synthesize_midpoint(
 }
 
 float4 SynthesizeMidpointPS(FullscreenVertex input) : SV_Target {
-    return synthesize_midpoint(input, 1.0, false, false, false);
+    return synthesize_midpoint(input, 1.0, false, false, false, false);
+}
+
+float4 SynthesizeGameMotionMidpointPS(FullscreenVertex input) : SV_Target {
+    return synthesize_midpoint(input, 1.0, false, false, false, true);
 }
 
 float4 SynthesizeNvidiaMidpointPS(FullscreenVertex input) : SV_Target {
     // NVIDIA OFA stores flow in signed S10.5 fixed point.
-    return synthesize_midpoint(input, 1.0 / 32.0, true, false, false);
+    return synthesize_midpoint(input, 1.0 / 32.0, true, false, false, false);
 }
 
 float4 SynthesizeNvidiaBidirectionalMidpointPS(
     FullscreenVertex input) : SV_Target {
     // NVIDIA OFA stores flow in signed S10.5 fixed point.
-    return synthesize_midpoint(input, 1.0 / 32.0, true, true, false);
+    return synthesize_midpoint(input, 1.0 / 32.0, true, true, false, false);
 }
 
 float4 SynthesizeNvidiaFastMidpointPS(FullscreenVertex input) : SV_Target {
-    return synthesize_midpoint(input, 1.0 / 32.0, true, false, true);
+    return synthesize_midpoint(input, 1.0 / 32.0, true, false, true, false);
 }
 
 float4 SynthesizeNvidiaFastBidirectionalMidpointPS(
     FullscreenVertex input) : SV_Target {
-    return synthesize_midpoint(input, 1.0 / 32.0, true, true, true);
+    return synthesize_midpoint(input, 1.0 / 32.0, true, true, true, false);
+}
+
+float4 ReprojectGeneratedPS(FullscreenVertex input) : SV_Target {
+    uint2 integer_pixel = uint2(input.position.xy);
+    if (integer_pixel.x >= Width || integer_pixel.y >= Height ||
+        Slice >= ArraySize) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    const float2 pixel = float2(integer_pixel);
+    CameraSample generated = sample_previous_target(pixel, Slice, ViewIndex);
+    if (generated.valid >= 0.5) {
+        return saturate(generated.color);
+    }
+    return saturate(sample_current_target(pixel, Slice, ViewIndex).color);
 }

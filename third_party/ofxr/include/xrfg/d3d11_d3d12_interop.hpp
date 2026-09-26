@@ -96,6 +96,7 @@ public:
         std::uint32_t current_destination_index,
         std::optional<std::uint32_t> synthetic_destination_index) noexcept;
 
+
     [[nodiscard]] HRESULT wait_for_idle() noexcept;
     [[nodiscard]] bool initialized() const noexcept;
 

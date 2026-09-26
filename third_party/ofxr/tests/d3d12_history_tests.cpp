@@ -65,6 +65,16 @@ void require_hresult(HRESULT result, const char* operation) {
     return SUCCEEDED(result);
 }
 
+void require_frame_start_gate(
+    xrfg::D3D12FrameSynthesizer& synthesizer,
+    const std::string& label) {
+    const HRESULT result = synthesizer.wait_for_previous_submission(500);
+    require(
+        operation_succeeded(result),
+        label + " failed with HRESULT " +
+            std::to_string(static_cast<std::int32_t>(result)));
+}
+
 [[nodiscard]] D3D12_HEAP_PROPERTIES heap_properties(D3D12_HEAP_TYPE type) noexcept {
     D3D12_HEAP_PROPERTIES properties{};
     properties.Type = type;
@@ -2087,6 +2097,14 @@ void test_rolling_frame_synthesizer(D3D12WarpFixture& fixture) {
             invalid_pair.current_serial == 0 && invalid_pair.fence_value == 0,
         "out-of-range pair submission was not rejected atomically");
 
+    // Release the deliberately blocked queue, then model V090's frame-start
+    // gate before advancing the temporal pair. Submission itself remains
+    // nonblocking and cannot accumulate another complete transaction.
+    require_hresult(gate->Signal(1), "ID3D12Fence::Signal(synthesis gate)");
+    require(
+        operation_succeeded(synthesizer.wait_for_previous_submission(500)),
+        "frame-start synthesis gate did not settle the asynchronous prime");
+
     std::future<SynthesisOutcome> pair_future = std::async(
         std::launch::async,
         [&synthesizer, &capture_b, &static_views] {
@@ -2117,6 +2135,9 @@ void test_rolling_frame_synthesizer(D3D12WarpFixture& fixture) {
             pair_ab.ticket.current_destination_index == 1,
         "A/B synthesis ticket is incorrect");
 
+    require(
+        operation_succeeded(synthesizer.wait_for_previous_submission(500)),
+        "frame-start synthesis gate did not settle the A/B pair");
     xrfg::D3D12FrameSynthesisTicket repeated_pair{};
     const ReprojectionViews repeated_views = make_reprojection_views(0.025F);
     require(
@@ -2144,13 +2165,6 @@ void test_rolling_frame_synthesizer(D3D12WarpFixture& fixture) {
             capture_c.fence_value > capture_b.fence_value,
         "capture C did not preserve A0/B1/C2 rolling chronology");
 
-    xrfg::D3D12HistoryCaptureTicket blocked_capture_d{};
-    require(
-        history->capture(0, &blocked_capture_d) == HRESULT_FROM_WIN32(ERROR_BUSY) &&
-            blocked_capture_d.serial == 0,
-        "history overwrote A at the first wrap before the A/B synthesis fence completed");
-
-    require_hresult(gate->Signal(1), "ID3D12Fence::Signal(synthesis gate)");
     fixture.execute_and_wait([](ID3D12GraphicsCommandList*) {});
 
     require_readback_matches(
@@ -2385,6 +2399,7 @@ void test_stereo_motion_synthesis_beats_same_pixel_blend(
         operation_succeeded(
             synthesizer.submit_prime(capture_a, static_views, 0, &prime)),
         "motion prime submission failed");
+    require_frame_start_gate(synthesizer, "embedded test frame-start gate");
 
     xrfg::D3D12HistoryCaptureTicket capture_b{};
     require(
@@ -2736,6 +2751,7 @@ void test_dlss_motion_vector_gpu_ingress(
         operation_succeeded(synthesizer.submit_prime(
             capture_a, views, 0, &prime, set_a)),
         "DLSS-motion prime failed");
+    require_frame_start_gate(synthesizer, "embedded test frame-start gate");
 
     xrfg::D3D12HistoryCaptureTicket capture_b{};
     require(
@@ -2916,6 +2932,7 @@ void test_rotation_aware_synthesis_beats_uncompensated_flow(
                 &prime,
                 std::move(motion_a))),
             std::string(label) + " prime submission failed");
+        require_frame_start_gate(synthesizer, "rotation frame-start gate");
 
         xrfg::D3D12HistoryCaptureTicket capture_b{};
         require(
@@ -3221,6 +3238,7 @@ void test_double_wide_single_slice_views(
         operation_succeeded(synthesizer.submit_prime(
             capture, views, 0, &prime)),
         "double-wide prime failed");
+    require_frame_start_gate(synthesizer, "embedded test frame-start gate");
     xrfg::D3D12FrameSynthesisTicket repeated{};
     require(
         operation_succeeded(synthesizer.submit_pair(
@@ -3330,6 +3348,7 @@ void test_srgb_synthesis_preserves_brightness(
     require(operation_succeeded(history->capture(0, &ca)) &&
         operation_succeeded(history->commit(ca)) &&
         operation_succeeded(synth.submit_prime(ca, views, 0, &prime)), "sRGB prime failed");
+    require_frame_start_gate(synth, "sRGB frame-start gate");
     require(operation_succeeded(history->capture(1, &cb)) &&
         operation_succeeded(history->commit(cb)) &&
         operation_succeeded(synth.submit_pair(cb, views, views, 0, 1, &pair)), "sRGB pair failed");
@@ -3470,7 +3489,7 @@ int main() {
             hardware_repeat_fixture.require_no_debug_errors();
             std::cout << "D3D12 hardware repeated-capture test passed\n";
         }
-        std::cout << "D3D12 WARP asynchronous history/synthesis tests passed\n";
+        std::cout << "D3D12 WARP asynchronous history/synthesis tests passed (embedded DLSS guide contract)\n";
         if (trace_test) {
             const auto path = xrfg::bridge_flight_logger().log_path();
             std::ifstream input(path);

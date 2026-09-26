@@ -49,8 +49,19 @@ struct LauncherSettings {
     const std::filesystem::path& layer_dll,
     std::uint32_t implementation_version);
 
+// Settings without tray controls survive re-arming and runtime cache upgrades.
+// logging_enabled remains exclusively controlled by LauncherSettings.
+constexpr unsigned kDefaultMaxFileMb = 32;
+struct RuntimeDiagnosticSettings {
+    unsigned max_file_mb{kDefaultMaxFileMb};
+    bool flush_each_event{};
+};
+[[nodiscard]] RuntimeDiagnosticSettings read_runtime_diagnostic_settings(
+    const std::filesystem::path& destination);
 [[nodiscard]] std::string build_runtime_ini(
-    const LauncherSettings& settings);
+    const LauncherSettings& settings,
+    unsigned max_file_mb = kDefaultMaxFileMb,
+    bool flush_each_event = false);
 
 [[nodiscard]] std::filesystem::path runtime_version_directory(
     const std::filesystem::path& local_directory,

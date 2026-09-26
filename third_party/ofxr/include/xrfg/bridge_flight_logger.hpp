@@ -5,6 +5,7 @@
 #include <memory>
 
 namespace xrfg {
+class RamTimingCapture;
 
 enum class BridgeFlightOperation : std::uint32_t {
     logger,
@@ -43,6 +44,17 @@ enum class BridgeFlightOperation : std::uint32_t {
     d3d11_publish,
     runtime_identity,
     presenter_submission,
+    // Correlates a presenter request with the original application display
+    // time: a=request sequence, b=source XrTime, c=pair sequence (zero repeat).
+    presenter_source,
+    // Only when the application enabled the Win32 time conversion extension:
+    // a=predicted XrTime, b=the same instant on this logger's microsecond
+    // timeline, c=QPC frequency. Repeated occasionally to detect drift.
+    presenter_clock_anchor,
+    // result=1 if the app enabled the extension and the runtime exposed its
+    // function, a=1 if the app requested it, b=1 if loading succeeded.
+    presenter_clock_capability,
+    presenter_queue_drop,
     presenter_transition,
     nvidia_gpu_stages,
     nvidia_gpu_total,
@@ -51,18 +63,76 @@ enum class BridgeFlightOperation : std::uint32_t {
     // this the pace and the loop's other costs are indistinguishable inside
     // one gap between records.
     presenter_pace,
-    history_capture,
-    gpu_fence_snapshot,
-    gpu_device_status,
-    nvidia_pack_submit,
-    nvidia_eye_execute,
-    nvidia_composite_submit,
+    synthesis_frame_start_wait,
     embedded_configuration,
-    // Sampled FSR diagnostics. These records are emitted only while the
-    // bridge flight logger is enabled, on the first Cinema pair and then once
-    // every 120 pairs. Together they preserve the per-eye association between
-    // the OpenXR view, OptiScaler DLSS stream and FSR inputs without adding
-    // per-frame disk traffic.
+    // When the GPU actually began and finished a pair's synthesis, on the
+    // same timeline as every other record. Duration alone cannot say whether
+    // the pixels existed when the presenter handed the frame over; only the
+    // finish time against that submission can.
+    synthesis_gpu_span,
+    // The application asked for more frames than the presenter produced and
+    // the virtual clock was held to the runtime's timeline instead of
+    // stepping past it. a is how far the step overshot, in nanoseconds.
+    virtual_clock_clamp,
+    // A runtime session state transition, exactly as the application receives
+    // it. result is the new XrSessionState; a is the session, b the event's
+    // own time. A runtime that stops asking for frames says so here and
+    // nowhere else the layer can see.
+    session_state,
+    // The once-per-pair hold releasing the application. result is the serial
+    // surplus the release discarded - the presenter had run that many frames
+    // beyond the two this hold is for, so the application had already missed
+    // its slot and the hold throttled nothing. a is how long it waited in
+    // microseconds, b the presenter's frame serial, c the serial the
+    // application had been served to. Zero surplus is the hold working; a
+    // surplus is the application running free, gated only by whatever it
+    // blocks on next.
+    presenter_pair_release,
+    // Adaptive NVIDIA cadence: result=1 when a synthetic slot is budgeted;
+    // a=application-end interval in ns, b=display period in ns,
+    // c=accumulated synthetic credit in thousandths before consumption.
+    // How hard the runtime-entry gate is actually working on a D3D11 session.
+    // result is the number of entries in this window that had to wait, a the
+    // mean wait and b the longest, both nanoseconds, c the longest any single
+    // entry held the gate. Zero contention across a session means the two
+    // threads were never inside the runtime together, so the gate is not what
+    // is protecting it - the earlier device-section attempt reported exactly
+    // that and it was read as a clean result rather than as a refutation.
+    runtime_entry_section,
+    // result is the HRESULT returned by history->capture; a is the
+    // application swapchain, b the image index, c the captured slot on
+    // success or UINT32_MAX on failure.
+    history_capture,
+    // Three-slot route: waits bracket the two producer handoffs. Handoff and
+    // ready carry a=current source id, b=previous id. Present carries the same
+    // identity, result=1 synthetic/0 real, c=runtime predicted display time.
+    three_slot_worker_wait,
+    three_slot_buffer_wait,
+    three_slot_handoff,
+    three_slot_gpu_ready,
+    three_slot_present,
+    // result=layer type, a=layer index, b=source swapchain,
+    // c=0 supported, 1 unsupported structure, 2 missing release snapshot.
+    composition_layer,
+    // result=HRESULT, a=source, b=owned output, c=publication fence value.
+    composition_publish,
+    timing_worker_run,
+    timing_slot_wait,
+    timing_director_wait,
+    timing_worker_publish,
+    timing_runtime_gate,
+    timing_worker_prepare,
+    timing_synthesis_complete,
+    timing_publication_complete,
+    timing_aux_complete,
+    timing_worker_build,
+    gpu_history,
+    gpu_synthesis,
+    gpu_timing_error,
+    luke_release,
+    luke_filter,
+    luke_cycle_wait,
+    // Embedded-only diagnostics appended to preserve V223 operation IDs.
     fsr_eye_binding,
     fsr_eye_resources,
     fsr_eye_rects,
@@ -90,7 +160,14 @@ public:
     void shutdown() noexcept;
 
     [[nodiscard]] bool enabled() const noexcept;
+    [[nodiscard]] bool ram_enabled() const noexcept;
     [[nodiscard]] std::filesystem::path log_path() const;
+
+    // Places a QueryPerformanceCounter value on this log's own timeline,
+    // so a GPU timestamp calibrated to QPC can be compared directly with
+    // the ms column of every other record.
+    [[nodiscard]] std::int64_t microseconds_for_counter(
+        std::int64_t counter) const noexcept;
 
     [[nodiscard]] BridgeFlightToken begin(
         BridgeFlightOperation operation,
@@ -116,6 +193,7 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    std::unique_ptr<RamTimingCapture> ram_;
 };
 
 [[nodiscard]] BridgeFlightLogger& bridge_flight_logger() noexcept;

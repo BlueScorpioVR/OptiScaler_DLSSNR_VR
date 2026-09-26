@@ -32,11 +32,15 @@ struct Fixture {
             (L"XR_APILAYER_XRFrameBridge_manual-42-" + std::to_wstring(id) + L".json");
         std::filesystem::create_directories(path.parent_path());
         if (json) std::ofstream(path) << "{}";
-        require(xrfg::implicit_layer::register_manifest(path, nullptr, state.registry_subkey), "seed registration");
+        require(xrfg::implicit_layer::register_manifest(
+            path, xrfg::implicit_layer::RegistryScope::current_user,
+            nullptr, state.registry_subkey), "seed registration");
         return path;
     }
     bool registered(const std::filesystem::path& path) {
-        return xrfg::implicit_layer::manifest_registered(path, state.registry_subkey);
+        return xrfg::implicit_layer::manifest_registered(
+            path, xrfg::implicit_layer::RegistryScope::current_user,
+            state.registry_subkey);
     }
 };
 
@@ -51,8 +55,12 @@ void cross_version_cleanup() {
     std::filesystem::create_directories(outside.parent_path());
     std::ofstream(foreign) << "foreign";
     std::ofstream(outside) << "outside";
-    require(xrfg::implicit_layer::register_manifest(foreign, nullptr, test.state.registry_subkey), "foreign registration");
-    require(xrfg::implicit_layer::register_manifest(outside, nullptr, test.state.registry_subkey), "outside registration");
+    require(xrfg::implicit_layer::register_manifest(
+        foreign, xrfg::implicit_layer::RegistryScope::current_user,
+        nullptr, test.state.registry_subkey), "foreign registration");
+    require(xrfg::implicit_layer::register_manifest(
+        outside, xrfg::implicit_layer::RegistryScope::current_user,
+        nullptr, test.state.registry_subkey), "outside registration");
     const auto orphan = current.parent_path() / L"XR_APILAYER_XRFrameBridge_manual-99-99.json";
     std::ofstream(orphan) << "orphan";
     const auto dll = old.parent_path() / L"XR_APILAYER_XRFrameBridge_diagnostic.dll";
@@ -77,7 +85,9 @@ void cross_version_cleanup() {
     const auto rearmed = test.seed(L"v069", 5);
     require(test.registered(rearmed) && !test.registered(old), "upgrade leaves only the new registration");
     // An old watchdog is scoped to its old lease: it cannot disarm a new arm.
-    require(xrfg::implicit_layer::retire_manifest(old, &error, test.state.registry_subkey), "late old watchdog");
+    require(xrfg::implicit_layer::retire_manifest(
+        old, xrfg::implicit_layer::RegistryScope::current_user,
+        &error, test.state.registry_subkey), "late old watchdog");
     require(test.registered(rearmed), "late watchdog preserves new arm");
 }
 
@@ -178,7 +188,9 @@ void runtime_stop_and_watchdog() {
     bool cleaned = false;
     std::wstring error;
     std::thread watchdog([&] { cleaned = watch_registered_arm(parent, next,
-        test.state.local_directory, &error, test.state.registry_subkey); });
+        test.state.local_directory, &error,
+        xrfg::implicit_layer::RegistryScope::current_user,
+        test.state.registry_subkey); });
     SetEvent(parent); // A signalled process handle uses the identical wait path.
     watchdog.join();
     CloseHandle(parent);
@@ -193,6 +205,23 @@ void runtime_stop_and_watchdog() {
     xrfg::implicit_layer::ManualArmControl embedded(test.state.local_directory / L"embedded");
     require(!embedded.stop_requested(), "embedded layer without tray control unchanged");
 }
+
+void integrity_scope_policy() {
+    using xrfg::implicit_layer::RegistryScope;
+    require(xrfg::implicit_layer::registry_scope_for_integrity_rid(
+                SECURITY_MANDATORY_MEDIUM_RID) == RegistryScope::current_user,
+        "medium integrity must use HKCU");
+    require(xrfg::implicit_layer::registry_scope_for_integrity_rid(
+                SECURITY_MANDATORY_HIGH_RID) == RegistryScope::local_machine,
+        "high integrity must use HKLM");
+    require(xrfg::implicit_layer::registry_scope_for_integrity_rid(
+                SECURITY_MANDATORY_SYSTEM_RID) == RegistryScope::local_machine,
+        "system integrity must use HKLM");
+    const auto current = xrfg::implicit_layer::preferred_registry_scope();
+    require(current == RegistryScope::current_user ||
+            current == RegistryScope::local_machine,
+        "current process scope must be valid");
+}
 } // namespace
 
 int main() {
@@ -202,7 +231,8 @@ int main() {
         window_lifecycle();
         blocked_manifest();
         runtime_stop_and_watchdog();
-        std::cout << "V069 registry recovery and production tray lifecycle checks passed\n";
+        integrity_scope_policy();
+        std::cout << "V074 dual-hive registry recovery and production tray lifecycle checks passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
