@@ -441,3 +441,7 @@ CyberFSR/imgui.ini
 /OptiScaler/misc/Telemetry.cpp
 /OptiScaler/misc/Telemetry.h
 release
+/build-ofxr/
+/build-ofxr-ffx/
+/tests/build/
+/x64/

@@ -22,11 +22,27 @@
 > parameter restoration and bounded non-UAV color copy needed by this build.
 
 > [!WARNING]
-> This is an unofficial experimental preview (internal head **V23218**). It may
+> This is an unofficial experimental preview (internal head **V23244**). It may
 > fail, corrupt the image or crash. It currently targets ordinary DLSS Super
 > Resolution with separate D3D12 color/depth/motion inputs. DLSS Ray
 > Reconstruction is not supported by this route. NVIDIA's proprietary
 > `nvngx_dlssnr.dll` is not included and must be supplied separately.
+
+### V23244 VR release source
+
+The **OFXR VR Framegen** menu selects Off, FidelityFX, Nvidia, Nvidia (new),
+or FSR 3.1. Nvidia (new) enables the experimental director; FSR consumes the
+game's DLSS depth/motion guides with independent eye histories. Witcher3VR
+publishes owned scene-only color for post-FSR gameplay HUD composition.
+General-game support remains experimental, not a universal installer.
+
+This revision retains V23238 rendering and NR lifetime safeguards; V23239-V23243
+readiness experiments are excluded. NR/DRED recording, image captures and the
+post-HUD file follow logging switches. Required GPU retirement remains active.
+
+Use the tested [Witcher 3 VR v0.9.8 package](https://github.com/tig3rmast3r/witcher3-vr/releases/tag/v0.9.8).
+The NVIDIA NR DLL is not redistributed. The separate general-game development
+lane and Wilsjo2 multipass fork are not merged into this release.
 
 <div align="center">
   <a href="https://github.com/sponsors/cdozdil?frequency=one-time"><img src="images/gh-sponsor-red.png" /></a>
