@@ -20,6 +20,13 @@ bool correct = true;
 bool alternating_eyes{};
 bool promotion_test{};
 bool fsr_test{}, fsr_missing{};
+bool fsr_queue{}, fsr_queue_slow{};
+bool fsr_queue_switch{};
+bool fsr_queue_gpu_pending{};
+ComPtr<ID3D12Fence> fsr_gpu_gate;
+std::jthread fsr_gpu_watchdog;
+std::atomic<bool> fsr_wait_before_gpu_complete{};
+std::vector<std::chrono::steady_clock::time_point> output_times;
 ComPtr<ID3D12Fence> promotion_gate;
 std::jthread promotion_unblock;
 std::atomic<bool> promotion_gate_released{};
@@ -112,7 +119,11 @@ XrResult XRAPI_CALL fake_destroy(XrSwapchain h) {
     std::scoped_lock lock(resources_mutex); destroyed+=static_cast<unsigned>(images.erase(h)); return XR_SUCCESS;
 }
 XrResult XRAPI_CALL fake_wait(XrSession,const XrFrameWaitInfo*,XrFrameState* s) {
-    if(fsr_test) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    if(fsr_queue_gpu_pending && fsr_gpu_gate && fsr_gpu_gate->GetCompletedValue()==0) {
+        fsr_wait_before_gpu_complete=true;
+        hr(fsr_gpu_gate->Signal(1), "release pending application GPU work at XR Wait");
+    }
+    if(fsr_test && !fsr_queue) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     ++waits; runtime_time+=8333333; s->predictedDisplayTime=runtime_time;
     s->predictedDisplayPeriod=8333333; s->shouldRender=XR_TRUE; return XR_SUCCESS;
 }
@@ -134,6 +145,8 @@ bool is_private_image(XrSwapchain handle) {
     return images.contains(handle);
 }
 XrResult XRAPI_CALL fake_end(XrSession,const XrFrameEndInfo* end) {
+    if(fsr_queue_slow && ends.load() == 5) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    output_times.push_back(std::chrono::steady_clock::now());
     ++ends;
     const auto* projection=reinterpret_cast<const XrCompositionLayerProjection*>(end->layers[0]);
     bool synthetic=synthetic_handles.contains(projection->views[0].subImage.swapchain);
@@ -222,11 +235,15 @@ int main(int argc,char** argv) {
         auto& s=session_state;s->handle=reinterpret_cast<XrSession>(0x211);s->graphics_binding=SessionGraphicsBinding::d3d12;
         s->optical_flow_backend=xrfg::D3D12OpticalFlowBackend::nvidia;
         s->nvidia_new_route = true;
-        fsr_test=argc>1 && std::string_view(argv[1]).starts_with("fsr-inline");
+        fsr_test=argc>1 && std::string_view(argv[1]).starts_with("fsr-");
+        fsr_queue=argc>1 && std::string_view(argv[1]).starts_with("fsr-queue");
+        fsr_queue_slow=argc>1 && std::string_view(argv[1]) == "fsr-queue-slow";
+        fsr_queue_switch=argc>1 && std::string_view(argv[1]) == "fsr-queue-switch";
+        fsr_queue_gpu_pending=argc>1 && std::string_view(argv[1]) == "fsr-queue-gpu-pending";
         fsr_missing=argc>1 && std::string_view(argv[1])=="fsr-inline-wait";
         if(fsr_test) {
             s->frame_generation_mode=xrfg::D3D12FrameGenerationMode::fsr3;
-            dispatch->steamvr_runtime=true;
+            dispatch->steamvr_runtime=fsr_queue;
         }
         s->control_revision=xrfg::embedded::snapshot().revision;
         hr(D3D12CreateDevice(nullptr,D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&s->d3d12_device)),"device");
@@ -297,6 +314,15 @@ int main(int argc,char** argv) {
             require(XR_SUCCEEDED(layer_wait_frame_impl(s->handle,nullptr,&prediction)),"producer wait");
             require(prediction.predictedDisplayPeriod==8333333,"native advertised period");
             require(XR_SUCCEEDED(layer_begin_frame_impl(s->handle,nullptr)),"producer begin");
+            if(fsr_queue_gpu_pending && n==3) {
+                require(XR_SUCCEEDED(wait_for_presenter_idle(s)), "pending GPU test drain");
+                hr(s->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fsr_gpu_gate)), "FSR pending GPU gate");
+                hr(s->d3d12_queue->Wait(fsr_gpu_gate.Get(),1), "hold application GPU work");
+                fsr_gpu_watchdog=std::jthread([] {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    fsr_gpu_gate->Signal(1); // Unblock a regressed CPU wait instead of hanging the test.
+                });
+            }
             std::array<XrCompositionLayerProjectionView,2> views;
             for(unsigned eye=0;eye<2;++eye) {
                 auto& v=views[eye];v={XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};v.pose.orientation.w=1;v.pose.position.y=float(n);
@@ -319,8 +345,23 @@ int main(int argc,char** argv) {
             if(fsr_test) {
                 require(!s->presenter_start_requested,
                     "FSR was queued for automatic presenter promotion");
-                require(!s->three_slot_director && !continuous_presenter_active(s),
-                    "FSR left its inline submission route");
+                require(!s->three_slot_director && !s->synthesis_thread.joinable(), "FSR used NVIDIA worker");
+                require(continuous_presenter_active(s) == (fsr_queue && !fsr_missing), "FSR runtime route");
+                if(fsr_queue && !fsr_missing) {
+                    std::scoped_lock lock(s->presenter_mutex);
+                    require(s->outstanding_presenter_submissions <= 2, "FSR output backlog exceeds two");
+                }
+            }
+            if(fsr_queue_switch && n==8) {
+                require(XR_SUCCEEDED(wait_for_presenter_idle(s)), "FSR switch drain");
+                s->frame_generation_mode=xrfg::D3D12FrameGenerationMode::ofxr;
+                s->pipelined_presenter_mode=true; // Also test real-app overlapping waits.
+                XrFrameState switch_prediction{XR_TYPE_FRAME_STATE};
+                require(XR_SUCCEEDED(layer_wait_frame_impl(s->handle,nullptr,&switch_prediction)), "switch Wait");
+                require(XR_SUCCEEDED(layer_begin_frame_impl(s->handle,nullptr)), "switch Begin");
+                end.displayTime=switch_prediction.predictedDisplayTime;
+                require(XR_SUCCEEDED(layer_end_frame_impl(s->handle,&end)), "switch End");
+                require(!continuous_presenter_active(s) && !s->fsr_two_slot_presenter, "FSR consumer survived route switch");
             }
             if(gap_test && (n==4 || n==6 || n==7)) {
                 require(XR_SUCCEEDED(wait_for_synthesis_handoff(s)),"gap prime completed");
@@ -348,8 +389,9 @@ int main(int argc,char** argv) {
             }
         }
         require(XR_SUCCEEDED(wait_for_synthesis_handoff(s)),"final worker");
-        require(XR_SUCCEEDED(wait_for_presenter_idle(s)),"director drain");stop_continuous_presenter(s);
-        const unsigned expected_count=fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
+        if(!fsr_queue_switch) require(XR_SUCCEEDED(wait_for_presenter_idle(s)),"director drain");
+        stop_continuous_presenter(s);
+        const unsigned expected_count=fsr_queue_switch ? 16 : fsr_missing ? 8 : gap_test ? 12 : promotion_test ? 14 : 15;
         require(submissions.size()==expected_count && waits==expected_count && begins==expected_count && ends==expected_count,"unique output/cycle count");
         if(fsr_missing) {
             for(unsigned i=0;i<8;++i) require(submissions[i]==std::pair<unsigned,bool>{i+1,false},"FSR missing guide repeated/lost real");
@@ -371,6 +413,13 @@ int main(int argc,char** argv) {
             }
         } else for(unsigned i=0;i<7;++i){require(submissions[2*i]==std::pair<unsigned,bool>{i+1,false},"real order");require(submissions[2*i+1].second,"synthetic order");}
         require(submissions.back()==std::pair<unsigned,bool>{8,false},"last real");require(correct,"stale/cross-eye/auxiliary pixels");
+        if(fsr_queue_gpu_pending) require(fsr_wait_before_gpu_complete,
+            "FSR consumer CPU-waited before entering XR with pending GPU work");
+        if(fsr_queue) {
+            require(waits == expected_count && output_times.size() == expected_count, "FSR repeated or lost output");
+            for(unsigned i=1;i<output_times.size();++i)
+                require(output_times[i]-output_times[i-1] >= std::chrono::milliseconds(6), "FSR bunched output slots");
+        }
         if(fsr_test) {const auto stats=xrfg::fsr_frame_generation_statistics();
             require(fsr_missing ? stats.attempts==0 : stats.used==7 && stats.failures==0,"FSR dispatch count/failed");}
         for(auto& c:chains){drain_swapchain_gpu(c);destroy_frame_generation_swapchains(c);destroy_composition_capture(c);}
@@ -382,6 +431,8 @@ int main(int argc,char** argv) {
         require(correct,"D3D12 debug errors");
         if(promotion_unblock.joinable())promotion_unblock.join();
         promotion_gate.Reset();
+        if(fsr_gpu_watchdog.joinable())fsr_gpu_watchdog.join();
+        fsr_gpu_gate.Reset();
         std::cout<<"Native D3D12 "<<(array?"array":"split")<<": 8 real/"<<(expected_count-8)<<" synthetic; FSR="<<fsr_test<<"; delayed promotion="<<promotion_test<<"; private poisoned-source eyes + static/dynamic quads; independent GPU queue; no debug errors\n";
         {std::scoped_lock lock(g_state_mutex);g_swapchains.clear();g_sessions.clear();}
         chains.clear();left.reset();right.reset();dynamic.reset();fixed.reset();
@@ -396,10 +447,12 @@ int main(int argc,char** argv) {
         if(promotion_gate)promotion_gate->Signal(1);
         if(promotion_unblock.joinable())promotion_unblock.join();
         if(blocked_synthesis)blocked_synthesis->Signal(1);
+        if(fsr_gpu_gate)fsr_gpu_gate->Signal(1);
+        if(fsr_gpu_watchdog.joinable())fsr_gpu_watchdog.join();
         if(session_state)stop_continuous_presenter(session_state);
         for(auto& c:chains){drain_swapchain_gpu(c);destroy_frame_generation_swapchains(c);destroy_composition_capture(c);}
         {std::scoped_lock lock(g_state_mutex);g_swapchains.clear();g_sessions.clear();}
-        chains.clear();images.clear();promotion_gate.Reset();blocked_synthesis.Reset();session_state.reset();
+        chains.clear();images.clear();promotion_gate.Reset();blocked_synthesis.Reset();fsr_gpu_gate.Reset();session_state.reset();
         std::cerr<<e.what()<<'\n';return 1;
     }
 }
