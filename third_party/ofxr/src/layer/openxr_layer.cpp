@@ -1,6 +1,7 @@
 #include "xrfg/d3d12_history.hpp"
 #include "xrfg/three_slot_buffer.hpp"
 #include "xrfg/two_output_schedule.hpp"
+#include "xrfg/midpoint_schedule.hpp"
 #include "xrfg/frame_capture.hpp"
 #include "xrfg/d3d12_frame_synthesizer.hpp"
 #include "xrfg/dlss_motion_vectors.hpp"
@@ -409,6 +410,7 @@ struct SessionState {
     std::thread synthesis_thread;
     bool three_slot_director{};
     bool fsr_two_slot_presenter{}; // presenter_mutex; immutable while thread runs
+    bool queued_nvidia_presenter{}; // Legacy synthesis, fresh S/B consumer; immutable while running.
     bool synthesis_busy{};
     bool director_draining{};
     std::uint64_t next_source_sequence{1};
@@ -1029,6 +1031,7 @@ template <typename Function>
 
 void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexcept;
 [[nodiscard]] bool fsr_two_slot_session(const std::shared_ptr<SessionState>& state) noexcept;
+[[nodiscard]] bool queued_nvidia_session(const std::shared_ptr<SessionState>& state) noexcept;
 void synthesis_worker_main(const std::shared_ptr<SessionState>& state) noexcept;
 [[nodiscard]] XrResult wait_for_synthesis_handoff(
     const std::shared_ptr<SessionState>& state) noexcept;
@@ -5029,14 +5032,16 @@ void continuous_presenter_main(
     state->presenter_condition.notify_all();
 }
 
-// Director for the three-slot route. This is the sole owner of downstream
-// frame cycles. It never submits a retained real twice and never emits empty
-// frames just to keep a counter moving.
+// Fresh-output consumer for the NVIDIA three-slot director, legacy NVIDIA
+// S/B queue, and SteamVR FSR S/B queue. It never submits a retained real twice
+// and never emits empty frames just to keep a counter moving.
 void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexcept {
     try {
-        // The NVIDIA director keeps its existing scheduler. FSR uses only the
-        // two queued outputs: no history worker, retained real, or repeats.
+        // Both consumers use a fixed grid rather than anchoring each deadline
+        // to a late wake-up. Keep FSR's long-End recovery distinct from NVIDIA.
         xrfg::TwoOutputSchedule fsr_schedule;
+        xrfg::TwoOutputSchedule director_schedule;
+        xrfg::MidpointSchedule midpoint_schedule;
         for (;;) {
             std::shared_ptr<ThreeSlotFrame> selected;
             std::shared_ptr<PresenterSubmission> borrowed;
@@ -5114,13 +5119,21 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             if (XR_FAILED(result)) { fail(result); break; }
             // Only the consumer is limited to headset cadence. The game's
             // WaitFrame contains no sleep and no dependency on director ticks.
+            const bool synthetic = selected ? selected->frame->synthetic
+                : borrowed->owned_frame && borrowed->owned_frame->synthetic;
             const auto pace_token = xrfg::bridge_flight_logger().begin(
                 xrfg::BridgeFlightOperation::presenter_pace);
-            std::chrono::steady_clock::time_point fsr_slot{};
-            if (state->fsr_two_slot_presenter) {
+            std::chrono::steady_clock::time_point submission_slot{};
+            {
                 const auto period = std::chrono::nanoseconds(state->presenter_display_period);
-                fsr_slot = fsr_schedule.claim(std::chrono::steady_clock::now(), period);
-                const auto remaining = fsr_slot - std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
+                if (state->three_slot_director)
+                    submission_slot = midpoint_schedule.claim(now, period, synthetic);
+                else {
+                    auto& schedule = state->fsr_two_slot_presenter ? fsr_schedule : director_schedule;
+                    submission_slot = schedule.claim(now, period);
+                }
+                const auto remaining = submission_slot - std::chrono::steady_clock::now();
                 if (remaining > std::chrono::steady_clock::duration::zero()) {
                     if (!state->presenter_pace_timer) {
                         state->presenter_pace_timer = CreateWaitableTimerExW(nullptr, nullptr,
@@ -5135,28 +5148,17 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
                             &due, 0, nullptr, nullptr, FALSE))
                         static_cast<void>(WaitForSingleObject(state->presenter_pace_timer, INFINITE));
                     else
-                        std::this_thread::sleep_until(fsr_slot);
-                }
-            } else
-            {
-                std::unique_lock lock(state->presenter_mutex);
-                if (state->presenter_schedule_valid) {
-                    state->presenter_condition.wait_until(lock, state->presenter_next_submit, [&] {
-                        return state->presenter_stop_requested || XR_FAILED(state->presenter_failure);
-                    });
+                        std::this_thread::sleep_until(submission_slot);
                 }
             }
             xrfg::bridge_flight_logger().end(pace_token,
                 xrfg::BridgeFlightOperation::presenter_pace, 0);
-            const auto submitted_at = std::chrono::steady_clock::now();
             const XrFrameEndInfo* source = selected ? &selected->frame->info
                 : borrowed->owned_frame ? &borrowed->owned_frame->info : borrowed->borrowed_frame;
             XrFrameEndInfo end = *source;
             end.next = nullptr;
             end.displayTime = prediction.predictedDisplayTime;
             if (!prediction.shouldRender) { end.layerCount = 0; end.layers = nullptr; }
-            const bool synthetic = selected ? selected->frame->synthetic
-                : borrowed->owned_frame && borrowed->owned_frame->synthetic;
             token = xrfg::bridge_flight_logger().begin(
                 xrfg::BridgeFlightOperation::internal_end_frame, handle_value(state->handle),
                 end.displayTime, end.layerCount);
@@ -5180,8 +5182,17 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
                 }
             }
             if (state->fsr_two_slot_presenter)
-                fsr_schedule.submitted(fsr_slot, std::chrono::nanoseconds(state->presenter_display_period),
+                fsr_schedule.submitted(submission_slot, std::chrono::nanoseconds(state->presenter_display_period),
                     std::chrono::steady_clock::now());
+            else if (state->three_slot_director)
+                midpoint_schedule.submitted(submission_slot,
+                    std::chrono::nanoseconds(state->presenter_display_period));
+            else
+                // Runtime blocking already consumed wall time. Advance the
+                // intended grid, not the late actual-submit time, and let
+                // claim() reanchor after a complete missed interval.
+                director_schedule.submitted(submission_slot,
+                    std::chrono::nanoseconds(state->presenter_display_period));
             {
                 std::scoped_lock lock(state->presenter_mutex);
                 if (selected) {
@@ -5194,14 +5205,9 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
                 }
                 state->presenter_inflight_frame.reset();
                 state->presenter_inflight_submission.reset();
-                const auto period = std::chrono::nanoseconds(state->presenter_display_period);
-                // Charge the blocking runtime call to this interval, never add
-                // another whole interval after it has already elapsed.
-                if (!state->fsr_two_slot_presenter)
-                    state->presenter_next_submit = submitted_at + period;
                 state->presenter_schedule_valid = state->presenter_display_period > 0;
             }
-            if (!state->fsr_two_slot_presenter)
+            if (state->three_slot_director)
             xrfg::bridge_flight_logger().event(xrfg::BridgeFlightOperation::three_slot_present,
                 synthetic ? 1 : 0, selected ? selected->source_sequence : 0,
                 selected ? selected->previous_sequence : 0, end.displayTime);
@@ -5238,6 +5244,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
         state->presenter_last_frame.reset();
         state->three_slot_director = three_slot_generation_session(state);
         state->fsr_two_slot_presenter = fsr_two_slot_session(state);
+        state->queued_nvidia_presenter = queued_nvidia_session(state);
         state->three_slots.clear();
         state->synthesis_job.reset();
         state->synthesis_busy = false;
@@ -5253,7 +5260,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
         state->presenter_failure = XR_SUCCESS;
         state->next_presenter_sequence = 1;
         state->outstanding_presenter_submissions = 0;
-        if (state->three_slot_director || state->fsr_two_slot_presenter) {
+        if (state->three_slot_director || state->fsr_two_slot_presenter || state->queued_nvidia_presenter) {
             // Seed was already presented by the inline path. Do not repeat it.
             seed_frame.reset();
         } else if (state->pipelined_presenter_mode && seed_frame) {
@@ -5266,7 +5273,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
             state->presenter_last_frame = std::move(seed_frame);
         }
         state->presenter_frame_state_valid = false;
-        if ((state->three_slot_director || state->fsr_two_slot_presenter) && state->last_inline_frame_state_valid) {
+        if ((state->three_slot_director || state->fsr_two_slot_presenter || state->queued_nvidia_presenter) && state->last_inline_frame_state_valid) {
             // Bootstrap the virtual producer without empty/repeated runtime
             // submissions. The director waits for an eligible buffer entry.
             state->presenter_frame_state = state->last_inline_frame_state;
@@ -5289,7 +5296,7 @@ void three_slot_director_main(const std::shared_ptr<SessionState>& state) noexce
         if (state->three_slot_director) {
             state->synthesis_thread = std::thread(synthesis_worker_main, state);
             state->presenter_thread = std::thread(three_slot_director_main, state);
-        } else if (state->fsr_two_slot_presenter) {
+        } else if (state->fsr_two_slot_presenter || state->queued_nvidia_presenter) {
             state->presenter_thread = std::thread(three_slot_director_main, state);
         } else {
             state->presenter_thread = std::thread(continuous_presenter_main, state);
@@ -5344,6 +5351,7 @@ void stop_continuous_presenter(
             state->three_slots.clear();
             state->three_slot_director = false;
             state->fsr_two_slot_presenter = false;
+            state->queued_nvidia_presenter = false;
             state->presenter_frame_state_valid = false;
             state->presenter_last_frame.reset();
             state->presenter_pending_current_pair_sequence = 0;
@@ -5374,6 +5382,15 @@ void stop_continuous_presenter(
     return state->dispatch->steamvr_runtime && state->menu_enabled &&
         state->graphics_binding == SessionGraphicsBinding::d3d12 &&
         state->frame_generation_mode == xrfg::D3D12FrameGenerationMode::fsr3;
+}
+
+[[nodiscard]] bool queued_nvidia_session(const std::shared_ptr<SessionState>& state) noexcept {
+    return state->menu_enabled &&
+        state->frame_generation_mode == xrfg::D3D12FrameGenerationMode::ofxr &&
+        state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia &&
+        !three_slot_generation_session(state) &&
+        (state->graphics_binding == SessionGraphicsBinding::d3d11 ||
+         state->graphics_binding == SessionGraphicsBinding::d3d12);
 }
 
 // Holds the application until the presenter has run a whole pair since it was
@@ -5550,9 +5567,9 @@ enqueue_presenter_submission(
                 : XR_ERROR_SESSION_NOT_RUNNING;
         }
         auto first = std::make_shared<PresenterSubmission>();
-        // One in-flight/queued pair is the whole FSR output budget. Admission
+        // One in-flight/queued pair is the queue-only output budget. Admission
         // is checked before private output acquisition and never drops S/B.
-        if (state->fsr_two_slot_presenter && state->outstanding_presenter_submissions != 0)
+        if ((state->fsr_two_slot_presenter || state->queued_nvidia_presenter) && state->outstanding_presenter_submissions != 0)
             return XR_ERROR_RUNTIME_FAILURE;
         first->sequence = state->next_presenter_sequence++;
         first->pair_sequence = first->sequence;
@@ -6370,7 +6387,12 @@ struct PreparedProjectionFrame {
             // runs forward to the midpoint and back a whole pair, every pair,
             // which reads as doubling that scales with motion and disappears
             // wherever the scene is still.
-            const bool defer_current_copy = !worker_submission && generation->d3d11_interop == nullptr;
+            // The legacy queue can hand S to the runtime while the producer
+            // advances. Submit B now as well, so its queue dependency precedes
+            // that next application frame rather than being inserted after S.
+            const bool defer_current_copy = !worker_submission &&
+                generation->d3d11_interop == nullptr &&
+                !state->session->queued_nvidia_presenter;
             if (!generation->d3d11_interop || SUCCEEDED(submit_result)) {
                 submit_result = request_pair
                                     ? generation->synthesizer->submit_pair(
@@ -6513,6 +6535,12 @@ struct PreparedProjectionFrame {
     const std::optional<ProjectionSnapshot>& previous_snapshot,
     const ProjectionSnapshot& current_snapshot) noexcept {
     constexpr float kFixedMidpoint = 0.5F;
+    // Match the validated new NVIDIA image contract. Predicted XR-time gaps
+    // must not move legacy's synthesized content toward B from pair to pair.
+    // Other backends retain their independently tested contracts.
+    if (state && state->frame_generation_mode != xrfg::D3D12FrameGenerationMode::fsr3 &&
+        state->optical_flow_backend == xrfg::D3D12OpticalFlowBackend::nvidia)
+        return kFixedMidpoint;
     if (!state || !previous_snapshot) {
         return kFixedMidpoint;
     }
@@ -7676,7 +7704,8 @@ XrResult layer_end_frame_impl(
     capture_application_metadata(state,end_info);
     const bool manually_disarmed = state->manual_control.stop_requested();
     const bool fsr_presenter_mismatch = use_continuous_presenter &&
-        fsr_two_slot_session(state) != state->fsr_two_slot_presenter;
+        fsr_two_slot_session(state) != state->fsr_two_slot_presenter ||
+        queued_nvidia_session(state) != state->queued_nvidia_presenter;
     if (manually_disarmed && !state->manual_stop_applied) {
         // The existing queue has been drained before taking the content lock.
         // Do not unload hooks/resources, cancel submitted GPU work, or hand
@@ -7801,7 +7830,8 @@ XrResult layer_end_frame_impl(
         {
             std::scoped_lock lock(state->presenter_mutex);
             route_changed = desired_director != state->three_slot_director ||
-                fsr_two_slot_session(state) != state->fsr_two_slot_presenter;
+                fsr_two_slot_session(state) != state->fsr_two_slot_presenter ||
+                queued_nvidia_session(state) != state->queued_nvidia_presenter;
         }
         if (route_changed)
             return bypass_generation(GenerationPrepareReason::presenter_route_changed);
@@ -7981,10 +8011,10 @@ XrResult layer_end_frame_impl(
     }
     if (use_continuous_presenter) {
         const XrResult capacity = wait_for_presenter_capacity(state,
-            state->fsr_two_slot_presenter ? 0 : 1);
+            (state->fsr_two_slot_presenter || state->queued_nvidia_presenter) ? 0 : 1);
         if (XR_FAILED(capacity)) return capacity;
     }
-    // The synthetic is displayed one display period before the current frame,
+    // For the remaining inline backends the synthetic is displayed one display period before the current frame,
     // so it should show the scene as it was one period before the current
     // capture - which is halfway between the two captures only when they are
     // two display periods apart, that is when the application is running at
@@ -8074,6 +8104,7 @@ XrResult layer_end_frame_impl(
         if (synthetic_built && current_built) {
             // The synthetic frame owns the deferred copies: they must reach
             // the queue after it has been handed to the runtime.
+            if (!state->queued_nvidia_presenter)
             for (const PreparedProjectionResource& resource :
                  prepared.resources) {
                 if (resource.generation.synthesizer) {
@@ -8119,7 +8150,7 @@ XrResult layer_end_frame_impl(
             prepared = {};
         } else {
             submitted_end_info = &presenter_first_frame->info;
-            if (state->fsr_two_slot_presenter) {
+            if (state->fsr_two_slot_presenter || state->queued_nvidia_presenter) {
                 // Auxiliary HUD/quad pixels need the same ownership guarantee
                 // as projection outputs while the application renders ahead.
                 XrResult owned = own_composition_images(state, *presenter_first_frame);
@@ -8189,7 +8220,7 @@ XrResult layer_end_frame_impl(
                 // The pair enqueued here is drained by the time the next one
                 // arrives, so this bound is a runaway guard rather than part
                 // of the steady-state cadence.
-                if (!state->fsr_two_slot_presenter)
+                if (!state->fsr_two_slot_presenter && !state->queued_nvidia_presenter)
                     result = wait_for_presenter_capacity(state, 2);
             }
         } else if (presenter_first_frame) {
@@ -8312,7 +8343,7 @@ XrResult layer_end_frame_impl(
 
     const bool promote_three_slot_after_inline = !use_continuous_presenter &&
         pipelined_presenter_start_requested &&
-        (three_slot_generation_session(state) || fsr_two_slot_session(state));
+        (three_slot_generation_session(state) || fsr_two_slot_session(state) || queued_nvidia_session(state));
     if (!use_continuous_presenter && pipelined_presenter_start_requested &&
         !promote_three_slot_after_inline) {
         std::shared_ptr<GeneratedFrameEndInfo> seed_frame;
@@ -8333,7 +8364,7 @@ XrResult layer_end_frame_impl(
             const XrResult start_result = start_requested_pipelined_presenter(nullptr);
             return XR_FAILED(start_result) ? start_result : result;
         }
-        if (!use_continuous_presenter && fsr_two_slot_session(state) &&
+        if (!use_continuous_presenter && (fsr_two_slot_session(state) || queued_nvidia_session(state)) &&
             prepared.kind == PreparedGenerationKind::prime) {
             // Prime is already presented: bootstrap prediction from that XR
             // cycle, not a repeated seed or an empty runtime submission.
@@ -8344,7 +8375,7 @@ XrResult layer_end_frame_impl(
     }
 
     if (use_continuous_presenter) {
-        if (state->fsr_two_slot_presenter) {
+        if (state->fsr_two_slot_presenter || state->queued_nvidia_presenter) {
             // S/B are queued now. Allow the application to render ahead;
             // admission at its next EndFrame prevents output reuse/backlog.
             if (presenter_content_lock.owns_lock()) presenter_content_lock.unlock();
@@ -8401,7 +8432,7 @@ XrResult layer_end_frame_impl(
         // continuity reset; treating it as a structural resize would retain a
         // private image in an uncertain ownership phase for the whole timeout.
         clear_generation_continuity(state);
-    } else if (fsr_two_slot_session(state) && !use_continuous_presenter) {
+    } else if ((fsr_two_slot_session(state) || queued_nvidia_session(state)) && !use_continuous_presenter) {
         if (!start_continuous_presenter(state, nullptr, true))
             return XR_ERROR_RUNTIME_FAILURE;
     } else if (promote_three_slot_after_inline) {

@@ -6,6 +6,7 @@
 #include "NrBeforeSrContract.h"
 #include "NrRetirementCadence.h"
 #include "NrHistoryContract.h"
+#include "NrGuideSnapshot.h"
 
 
 #include "DlssNr_Codec.h"
@@ -243,7 +244,8 @@ struct NrPerHandle
     unsigned int workWidth = 0;
     unsigned int workHeight = 0;
 
-    // Cloned unconditionally when running at present, and only for typeless formats otherwise.
+    // Private per-handle guide snapshots, typed and typeless alike. Never hand
+    // mutable game motion/depth surfaces directly to the NR backend.
     ID3D12Resource* depthClone = nullptr;
     ID3D12Resource* motionClone = nullptr;
 
@@ -853,81 +855,18 @@ void Barrier(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* res, D3D12_RESO
     NrFlightTrace::BarrierAfter(cmdList, role, res, from, to);
 }
 
-// A typeless resource cannot be viewed, and NGX builds its own views with nothing to tell it which
-// format to use. Depth is very often declared typeless, so the typed member of the same family is
-// substituted; CopyResource accepts that as a destination for the typeless original.
-DXGI_FORMAT TypedGuideFormat(DXGI_FORMAT f)
+ID3D12Resource* PrivateNrGuide(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList,
+                             ID3D12Resource* source, ID3D12Resource** snapshot, bool& reset)
 {
-    switch (f)
-    {
-    case DXGI_FORMAT_R32_TYPELESS:
-        return DXGI_FORMAT_R32_FLOAT;
-    case DXGI_FORMAT_R16_TYPELESS:
-        return DXGI_FORMAT_R16_UNORM;
-    case DXGI_FORMAT_R24G8_TYPELESS:
-        return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-    case DXGI_FORMAT_R32G8X24_TYPELESS:
-        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-    case DXGI_FORMAT_R32G32_TYPELESS:
-        return DXGI_FORMAT_R32G32_FLOAT;
-    case DXGI_FORMAT_R16G16_TYPELESS:
-        return DXGI_FORMAT_R16G16_FLOAT;
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-        return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-        return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    default:
-        return f;
+    const HRESULT result = DlssNr::SnapshotNrGuide(device, cmdList, source, snapshot, Barrier,
+        [&](ID3D12Resource*& replaced) { ParkNrResource(replaced); reset = true; });
+    if (FAILED(result)) {
+        NrFlightTrace::Write("NR_GUIDE_FAILED", cmdList, L"V23235 private NR guide", source,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE, result);
+        return nullptr;
     }
-}
-
-bool IsTypeless(DXGI_FORMAT f) { return TypedGuideFormat(f) != f; }
-
-// Creates a typed twin of a guide buffer, matching everything but the format.
-ID3D12Resource* CreateGuideClone(ID3D12Device* device, ID3D12Resource* source)
-{
-    D3D12_RESOURCE_DESC desc = source->GetDesc();
-    desc.Format = TypedGuideFormat(desc.Format);
-    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-
-    D3D12_HEAP_PROPERTIES heap {};
-    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-    ID3D12Resource* res = nullptr;
-    device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
-                                    nullptr, IID_PPV_ARGS(&res));
-    return res;
-}
-
-// Hands back something the model can actually read: the guide itself when it is typed, or a typed copy
-// of it when it is not. NGX requires its inputs in NON_PIXEL_SHADER_RESOURCE at evaluate time, which is
-// a documented contract rather than a guess about any one game's frame graph, so that is the state
-// transitioned away from and back to here.
-ID3D12Resource* ReadableGuide(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList,
-                              ID3D12Resource* source, ID3D12Resource** clone)
-{
-    if (source == nullptr || !IsTypeless(source->GetDesc().Format))
-        return source;
-
-    if (*clone == nullptr)
-    {
-        *clone = CreateGuideClone(device, source);
-
-        if (*clone == nullptr)
-            return nullptr;
-
-        LOG_DEBUG("DLSS-NR cloned a typeless guide as format {}",
-                 (int) TypedGuideFormat(source->GetDesc().Format));
-    }
-
-    Barrier(cmdList, source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_COPY_SOURCE, L"guide-source-copy-begin");
-    cmdList->CopyResource(*clone, source);
-    Barrier(cmdList, source, D3D12_RESOURCE_STATE_COPY_SOURCE,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, L"guide-source-copy-end");
-    Barrier(cmdList, *clone, D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, L"guide-clone-ready");
-    return *clone;
+    NrFlightTrace::Write("NR_GUIDE_PRIVATE", cmdList, L"V23235 private NR guide", *snapshot);
+    return *snapshot;
 }
 
 // The upscaler's own names differ between super resolution and ray reconstruction, and only one set is
@@ -1563,8 +1502,8 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
         modelInput = nr.colorSmall;
     }
 
-    ID3D12Resource* depthIn = ReadableGuide(device, cmdList, depth, &nr.depthClone);
-    ID3D12Resource* motionIn = ReadableGuide(device, cmdList, motion, &nr.motionClone);
+    ID3D12Resource* depthIn = PrivateNrGuide(device, cmdList, depth, &nr.depthClone, nr.reset);
+    ID3D12Resource* motionIn = PrivateNrGuide(device, cmdList, motion, &nr.motionClone, nr.reset);
 
     if (depthIn == nullptr || motionIn == nullptr)
     {
@@ -2187,8 +2126,8 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
         modelInput = nr.colorSmall;
     }
 
-    ID3D12Resource* depthIn = ReadableGuide(device, cmdList, depth, &nr.depthClone);
-    ID3D12Resource* motionIn = ReadableGuide(device, cmdList, motion, &nr.motionClone);
+    ID3D12Resource* depthIn = PrivateNrGuide(device, cmdList, depth, &nr.depthClone, nr.reset);
+    ID3D12Resource* motionIn = PrivateNrGuide(device, cmdList, motion, &nr.motionClone, nr.reset);
 
     if (depthIn == nullptr || motionIn == nullptr)
     {

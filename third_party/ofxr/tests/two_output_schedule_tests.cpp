@@ -22,6 +22,13 @@ int main() {
         check(schedule.claim(now, period) == now); // Starvation: no catch-up burst.
         schedule.submitted(now, period);
         check(schedule.claim(now + microseconds(1), period) == now + period);
+        // NVIDIA charges a blocking End to the elapsed interval; it must not
+        // add a fresh whole interval after End returns. Small overruns retain
+        // the grid, while starvation reanchors without a catch-up burst.
+        schedule.submitted(now, period);
+        check(schedule.claim(now + period + microseconds(500), period) == now + period);
+        check(schedule.claim(now + 3*period, period) == now + 3*period);
+        // FSR's already validated long-End recovery remains unchanged.
         schedule.submitted(now, period, now + milliseconds(25));
         check(schedule.claim(now + milliseconds(25), period) == now + milliseconds(25) + period);
         std::cout << "Immediate first output, stable grid, bounded starvation recovery\n";

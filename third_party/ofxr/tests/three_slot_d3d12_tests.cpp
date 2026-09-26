@@ -22,6 +22,9 @@ bool promotion_test{};
 bool fsr_test{}, fsr_missing{};
 bool fsr_queue{}, fsr_queue_slow{};
 bool fsr_queue_switch{};
+bool legacy_queue{};
+bool legacy_early_current{};
+bool midpoint_cadence{};
 bool fsr_queue_gpu_pending{};
 ComPtr<ID3D12Fence> fsr_gpu_gate;
 std::jthread fsr_gpu_watchdog;
@@ -145,12 +148,30 @@ bool is_private_image(XrSwapchain handle) {
     return images.contains(handle);
 }
 XrResult XRAPI_CALL fake_end(XrSession,const XrFrameEndInfo* end) {
-    if(fsr_queue_slow && ends.load() == 5) std::this_thread::sleep_for(std::chrono::milliseconds(25));
     output_times.push_back(std::chrono::steady_clock::now());
+    if(fsr_queue_slow && ends.load() == 5) std::this_thread::sleep_for(std::chrono::milliseconds(25));
     ++ends;
     const auto* projection=reinterpret_cast<const XrCompositionLayerProjection*>(end->layers[0]);
     bool synthetic=synthetic_handles.contains(projection->views[0].subImage.swapchain);
     const unsigned frame_id=static_cast<unsigned>(projection->views[0].pose.position.y);
+    if (legacy_early_current && synthetic && session_state->queued_nvidia_presenter) {
+        std::shared_ptr<GeneratedFrameEndInfo> next;
+        {
+            std::scoped_lock lock(session_state->presenter_mutex);
+            require(!session_state->presenter_submissions.empty(), "B queued alongside S");
+            next=session_state->presenter_submissions.front()->owned_frame;
+        }
+        require(next != nullptr, "private B ownership");
+        require(next->pending_current_copies.empty(), "B copy is already submitted before S EndFrame");
+        const auto* b=reinterpret_cast<const XrCompositionLayerProjection*>(next->info.layers[0]);
+        for (unsigned eye=0;eye<2;++eye) {
+            const auto sub=b->views[eye].subImage;
+            const auto image=submitted_image(sub.swapchain);
+            require((pixel(image.Get(),sub.imageArrayIndex)&255)==
+                static_cast<unsigned>(b->views[eye].pose.position.y),
+                "fresh private B pixels available before S EndFrame returns");
+        }
+    }
     unsigned real_id=0;
     for(unsigned eye=0;eye<2;++eye) {
         auto sub=projection->views[eye].subImage;
@@ -159,10 +180,13 @@ XrResult XRAPI_CALL fake_end(XrSession,const XrFrameEndInfo* end) {
             is_private_image(sub.swapchain)
                 ? D3D12_RESOURCE_STATE_COMMON
                 : D3D12_RESOURCE_STATE_RENDER_TARGET);
+        if(((p>>8)&255)!=(eye?160u:80u))
+            std::cerr<<"eye mismatch frame="<<frame_id<<" synthetic="<<synthetic<<" eye="<<eye<<" pixel="<<std::hex<<p<<std::dec<<'\n';
         correct &= ((p>>8)&255)==(eye?160u:80u);
         if(!synthetic) {
             if(eye==0) real_id=p&255;
             const unsigned expected=alternating_eyes && frame_id>1 && frame_id%2!=eye ? frame_id-1:frame_id;
+            if((p&255)!=expected)std::cerr<<"real mismatch frame="<<frame_id<<" eye="<<eye<<" expected="<<expected<<" got="<<(p&255)<<'\n';
             correct &= (p&255)==expected;
         }
     }
@@ -176,6 +200,8 @@ XrResult XRAPI_CALL fake_end(XrSession,const XrFrameEndInfo* end) {
                 ? D3D12_RESOURCE_STATE_COMMON
                 : D3D12_RESOURCE_STATE_RENDER_TARGET);
         const unsigned expected=i==2 ? 55 : static_cast<unsigned>(q->pose.position.y);
+        if((p&255)!=expected || ((p>>8)&255)!=60*i)
+            std::cerr<<"HUD mismatch frame="<<frame_id<<" layer="<<i<<" expected="<<expected<<" pixel="<<std::hex<<p<<std::dec<<'\n';
         correct &= (p&255)==expected && ((p>>8)&255)==60*i;
     }
     submissions.emplace_back(frame_id,synthetic);
@@ -216,11 +242,11 @@ std::shared_ptr<SwapchainState> source(unsigned id,unsigned slices,bool projecti
     {std::scoped_lock lock(g_state_mutex);g_swapchains[c->handle]=c;}
     return c;
 }
-void release(const std::shared_ptr<SwapchainState>& c) {
+void release(const std::shared_ptr<SwapchainState>& c, bool poison = true) {
     c->acquired_indices.push_back(0);c->front_waited=true;
     XrSwapchainImageReleaseInfo info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     require(XR_SUCCEEDED(layer_release_swapchain_image_impl(c->handle,&info)),"source release");
-    if(!fsr_test) fill(c->enumerated_d3d12_images[0].Get(),239,238); // director must own a private capture
+    if(!fsr_test && poison) fill(c->enumerated_d3d12_images[0].Get(),239,238); // queued director must own a private capture
 }
 }
 
@@ -236,8 +262,29 @@ int main(int argc,char** argv) {
         s->optical_flow_backend=xrfg::D3D12OpticalFlowBackend::nvidia;
         s->nvidia_new_route = true;
         fsr_test=argc>1 && std::string_view(argv[1]).starts_with("fsr-");
+        legacy_queue=argc>1 && std::string_view(argv[1]).starts_with("legacy-queue");
+        legacy_early_current=argc>1 && std::string_view(argv[1])=="legacy-queue-early-b";
+        midpoint_cadence=argc>1 && std::string_view(argv[1])=="midpoint-cadence";
+        if(legacy_queue) {
+            s->nvidia_new_route=false;
+            s->minimum_runtime_display_period=8333333;
+            ProjectionSnapshot previous, current;
+            previous.display_time=1000000000;
+            for(int periods=1;periods<=5;++periods) {
+                current.display_time=previous.display_time+periods*8333333;
+                require(synthetic_interpolation_fraction(s,previous,current)==0.5F,
+                    "legacy NVIDIA fraction must stay at the validated midpoint");
+            }
+            current.display_time=previous.display_time+3*8333333;
+            s->frame_generation_mode=xrfg::D3D12FrameGenerationMode::fsr3;
+            require(synthetic_interpolation_fraction(s,previous,current)>0.66F,
+                "FSR fraction contract changed during legacy-only correction");
+            s->frame_generation_mode={};
+            dispatch->steamvr_runtime=std::string_view(argv[1]) != "legacy-queue-vdxr";
+        }
         fsr_queue=argc>1 && std::string_view(argv[1]).starts_with("fsr-queue");
         fsr_queue_slow=argc>1 && std::string_view(argv[1]) == "fsr-queue-slow";
+        fsr_queue_slow=fsr_queue_slow || (argc>1 && std::string_view(argv[1]) == "legacy-queue-slow");
         fsr_queue_switch=argc>1 && std::string_view(argv[1]) == "fsr-queue-switch";
         fsr_queue_gpu_pending=argc>1 && std::string_view(argv[1]) == "fsr-queue-gpu-pending";
         fsr_missing=argc>1 && std::string_view(argv[1])=="fsr-inline-wait";
@@ -282,12 +329,14 @@ int main(int argc,char** argv) {
         s->last_inline_frame_state.predictedDisplayTime=runtime_time;s->last_inline_frame_state.shouldRender=XR_TRUE;s->last_inline_frame_state_valid=true;
         if(fsr_test) require(!three_slot_generation_session(s),
             "FSR was admitted to the three-slot director");
-        if(!promotion_test && !fsr_test) {
+        if(!promotion_test && !fsr_test && !legacy_queue) {
             require(start_continuous_presenter(s,nullptr,false),"promotion");
             require(s->three_slot_director && s->synthesis_thread.joinable(),"native did not enter three lanes");
         }
         for(unsigned n=1;n<=8;++n) {
             require(XR_SUCCEEDED(wait_for_synthesis_handoff(s)),"worker rendezvous");
+            if(midpoint_cadence && n>2)
+                std::this_thread::sleep_for(std::chrono::milliseconds(3));
             // RE Village: releases need not be one-to-one with EndFrames.
             // Exercise left-only, right-only, then both-eye double captures.
             if(gap_test && (n==4 || n==6 || n==7)) {
@@ -308,11 +357,14 @@ int main(int argc,char** argv) {
                 }
                 std::scoped_lock lock(left->mutex);left->last_released_motion_vectors=std::move(guides);
             }
-            fill(dynamic->enumerated_d3d12_images[0].Get(),n,60);release(dynamic);
-            if(n==1){fill(fixed->enumerated_d3d12_images[0].Get(),55,120);release(fixed);}
+            // Legacy's first prime is inline with borrowed auxiliary images;
+            // poisoning those before its synchronous End violates that input
+            // contract. Once queued, poison the dynamic HUD to test ownership.
+            fill(dynamic->enumerated_d3d12_images[0].Get(),n,60);release(dynamic,!legacy_queue || n>1);
+            if(n==1){fill(fixed->enumerated_d3d12_images[0].Get(),55,120);release(fixed,!legacy_queue);}
             XrFrameState prediction{XR_TYPE_FRAME_STATE};
             require(XR_SUCCEEDED(layer_wait_frame_impl(s->handle,nullptr,&prediction)),"producer wait");
-            require(prediction.predictedDisplayPeriod==8333333,"native advertised period");
+            require(prediction.predictedDisplayPeriod==(legacy_queue && n>1 ? 16666666 : 8333333),"advertised period");
             require(XR_SUCCEEDED(layer_begin_frame_impl(s->handle,nullptr)),"producer begin");
             if(fsr_queue_gpu_pending && n==3) {
                 require(XR_SUCCEEDED(wait_for_presenter_idle(s)), "pending GPU test drain");
@@ -338,10 +390,26 @@ int main(int argc,char** argv) {
                 reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[0]),reinterpret_cast<XrCompositionLayerBaseHeader*>(&quads[1])};
             XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=prediction.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
             end.layerCount=promotion_test && !s->three_slot_director ? 1 : 3;end.layers=layers;
-            const unsigned independence_frame=fsr_test ? 0 : promotion_test ? 5 : 2;
+            const unsigned independence_frame=(fsr_test || legacy_queue) ? 0 : promotion_test ? 5 : 2;
             if(n==independence_frame){hr(s->d3d12_device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&blocked_synthesis)),"test gate");
                 hr(s->d3d12_synthesis_queue->Wait(blocked_synthesis.Get(),1),"block synthesis");}
             require(XR_SUCCEEDED(layer_end_frame_impl(s->handle,&end)),"actual EndFrame");
+            if(legacy_queue) {
+                require(continuous_presenter_active(s) && s->queued_nvidia_presenter &&
+                    !s->three_slot_director && !s->synthesis_thread.joinable(),
+                    "legacy NVIDIA did not use fresh-output consumer");
+                {
+                    std::scoped_lock lock(s->presenter_mutex);
+                    require(s->outstanding_presenter_submissions<=2, "legacy backlog exceeds pair");
+                }
+                if(n==4) {
+                    require(XR_SUCCEEDED(wait_for_presenter_idle(s)), "legacy starvation drain");
+                    const auto count=ends.load(), wait_count=waits.load();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                    require(ends==count && waits==wait_count,
+                        "legacy consumer repeated or opened XR cycles while starved");
+                }
+            }
             if(fsr_test) {
                 require(!s->presenter_start_requested,
                     "FSR was queued for automatic presenter promotion");
@@ -413,9 +481,16 @@ int main(int argc,char** argv) {
             }
         } else for(unsigned i=0;i<7;++i){require(submissions[2*i]==std::pair<unsigned,bool>{i+1,false},"real order");require(submissions[2*i+1].second,"synthetic order");}
         require(submissions.back()==std::pair<unsigned,bool>{8,false},"last real");require(correct,"stale/cross-eye/auxiliary pixels");
+        if(midpoint_cadence) {
+            require(output_times.size()==submissions.size(), "midpoint runtime receipts");
+            for(unsigned i=1;i<submissions.size();++i)
+                if(submissions[i-1].second && !submissions[i].second)
+                    require(output_times[i]-output_times[i-1]>=std::chrono::milliseconds(6),
+                        "real endpoint stole a delayed midpoint interval");
+        }
         if(fsr_queue_gpu_pending) require(fsr_wait_before_gpu_complete,
             "FSR consumer CPU-waited before entering XR with pending GPU work");
-        if(fsr_queue) {
+        if(fsr_queue || legacy_queue) {
             require(waits == expected_count && output_times.size() == expected_count, "FSR repeated or lost output");
             for(unsigned i=1;i<output_times.size();++i)
                 require(output_times[i]-output_times[i-1] >= std::chrono::milliseconds(6), "FSR bunched output slots");
