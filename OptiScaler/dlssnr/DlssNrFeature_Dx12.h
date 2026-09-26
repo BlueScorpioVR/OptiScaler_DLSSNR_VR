@@ -2,6 +2,7 @@
 
 #include <d3d12.h>
 #include <nvsdk_ngx.h>
+#include "NrSubmissionLedger.h"
 
 // V23070: queue-depth-safe DLSS Neural Rendering route, selectable before or after super resolution.
 //
@@ -41,8 +42,10 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
 // command lists owned by the game, so this is the first point where a fence can be attached to that
 // work. The next evaluate for the same source handle will not reuse the NVIDIA feature or its scratch
 // surfaces until this fence has retired.
-void NotifyCommandListsSubmitted(ID3D12CommandQueue* queue, unsigned int commandListCount,
-                                 ID3D12CommandList* const* commandLists);
+std::vector<NrSubmissionReceipt> TakeCommandListSubmissionReceipts(
+    unsigned int commandListCount, ID3D12CommandList* const* commandLists);
+void CompleteCommandListSubmission(ID3D12CommandQueue* queue,
+                                   const std::vector<NrSubmissionReceipt>& receipts);
 
 // Retires the model feature and resources associated with one source upscaler handle. The resources
 // are parked rather than destroyed immediately because the GPU can still reference them.

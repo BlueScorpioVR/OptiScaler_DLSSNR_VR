@@ -632,6 +632,7 @@ void ResTrack_Dx12::hkCreateUnorderedAccessView(ID3D12Device* This, ID3D12Resour
 void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumCommandLists,
                                           ID3D12CommandList* const* ppCommandLists)
 {
+    const auto nrReceipts = DlssNr::TakeCommandListSubmissionReceipts(NumCommandLists, ppCommandLists);
     auto fg = State::Instance().currentFG;
 
     if (fg != nullptr && fg->IsActive() && !fg->IsPaused())
@@ -689,7 +690,7 @@ void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumComm
         if (!found.empty())
         {
             o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
-            DlssNr::NotifyCommandListsSubmitted(This, NumCommandLists, ppCommandLists);
+            DlssNr::CompleteCommandListSubmission(This, nrReceipts);
 
             for (size_t i = 0; i < found.size(); i++)
             {
@@ -703,7 +704,7 @@ void ResTrack_Dx12::hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumComm
     LOG_TRACK("Done NumCommandLists: {}", NumCommandLists);
 
     o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
-    DlssNr::NotifyCommandListsSubmitted(This, NumCommandLists, ppCommandLists);
+    DlssNr::CompleteCommandListSubmission(This, nrReceipts);
 }
 
 #pragma region Heap hooks

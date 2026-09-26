@@ -4,6 +4,8 @@
 
 #include "DlssNr.h"
 #include "NrBeforeSrContract.h"
+#include "NrRetirementCadence.h"
+#include "NrHistoryContract.h"
 
 
 #include "DlssNr_Codec.h"
@@ -219,9 +221,8 @@ struct NrPerHandle
 
     // NGX evaluate parameters are mutable call state. Per-handle ownership fixed cross-eye
     // mutation, but still reused one table while several command lists from the same eye were in
-    // flight. Keying the table by command-list identity makes its lifetime follow D3D12's own
-    // allocator/list retirement rule: the game cannot legally reset and reuse that list until its
-    // previous GPU execution has completed.
+    // flight. Command-list identity alone is NOT a retirement proof (Reset can use another
+    // allocator). Reuse is protected by the source handle's exact submission receipt and fence.
     std::unordered_map<ID3D12GraphicsCommandList*, NVSDK_NGX_Parameter*> evaluateParams;
 
     // The model cannot read and write one resource, so the frame is staged through these.
@@ -249,6 +250,8 @@ struct NrPerHandle
     unsigned int width = 0;
     unsigned int height = 0;
     bool reset = true;
+    bool sourceReset = false;
+    unsigned long long sourceResetRequests = 0, lastSourceResetReport = 0;
 
     // Dimensions of the guides as the upscaler handed them over, kept for the present path, which runs
     // long after that call has returned.
@@ -278,16 +281,37 @@ int g_capabilityFloatSlot = -1;
 std::unordered_map<unsigned int, NrPerHandle> g_nrByHandle;
 std::unique_ptr<DlssNr_Dx12> g_compose;
 
-// NVIDIA NR owns mutable state behind each feature handle. Recording the next evaluate while the
-// previous evaluate for that same handle is still executing is normally hidden by the game's short
-// queue. OFXR deliberately deepens that queue, exposing the driver's internal reuse and eventually
-// hanging in the signed model's ResourceBarrier sequence. Parameters and descriptors were already
-// made immutable in V23070/V23214; the feature and its scratch surfaces are the remaining per-handle
-// state. Track the actual game submission and retire it before that handle is recorded again.
+void CaptureSourceHistoryReset(NrPerHandle& nr, unsigned int sourceHandleId,
+                               NVSDK_NGX_Parameter* params)
+{
+    int sourceReset = 0;
+    const bool available = params->Get(NVSDK_NGX_Parameter_Reset, &sourceReset) ==
+                           NVSDK_NGX_Result_Success;
+    nr.sourceReset = available && sourceReset != 0;
+    nr.reset = DlssNr::NrResetWithSource(nr.reset, available, sourceReset);
+    const auto* cfg = Config::Instance();
+    if (!nr.sourceReset || !(cfg->LogToFile.value_or_default() ||
+                            cfg->LogToConsole.value_or_default() || cfg->LogToNGX.value_or_default()))
+        return;
+    ++nr.sourceResetRequests;
+    const auto now = GetTickCount64();
+    if (nr.lastSourceResetReport == 0 || now - nr.lastSourceResetReport >= 1000)
+    {
+        LOG_INFO("V23228 NR source history reset handle {} source_requests {} pending {}",
+                 sourceHandleId, nr.sourceResetRequests, nr.reset);
+        nr.lastSourceResetReport = now;
+    }
+}
+
+// Retire exact submissions before reusing each feature's parameters and scratch.
+// DRED stops inside NR, but does not prove the opaque vendor backend's root cause.
+// Different feature histories must not add cross-eye CPU waits: V23226 prolonged
+// startup instability and its backend-global retirement policy was rejected.
 struct NrHandleFlight
 {
     bool awaitingSubmission = false;
     ID3D12GraphicsCommandList* recordedList = nullptr;
+    unsigned long long recording = 0;
     Microsoft::WRL::ComPtr<ID3D12Fence> fence;
     unsigned long long fenceValue = 0;
 };
@@ -301,7 +325,7 @@ struct NrQueueFence
 
 std::mutex g_nrFlightMutex;
 std::unordered_map<unsigned int, NrHandleFlight> g_nrFlights;
-std::unordered_map<ID3D12GraphicsCommandList*, std::unordered_set<unsigned int>> g_nrRecordedLists;
+DlssNr::NrSubmissionLedger g_nrSubmissionLedger;
 std::unordered_map<ID3D12CommandQueue*, NrQueueFence> g_nrQueueFences;
 std::atomic<unsigned long long> g_nrRetirementSkips { 0 };
 std::atomic<bool> g_nrRetirementSignalFailed { false };
@@ -315,11 +339,47 @@ void MarkNrRecorded(unsigned int sourceHandleId, ID3D12GraphicsCommandList* comm
     NrHandleFlight& flight = g_nrFlights[sourceHandleId];
     flight.awaitingSubmission = true;
     flight.recordedList = commandList;
-    g_nrRecordedLists[commandList].insert(sourceHandleId);
+    flight.recording = g_nrSubmissionLedger.Record(sourceHandleId, commandList).recording;
+    wchar_t label[160] {};
+    swprintf_s(label, L"NR_RECORD handle=%u recording=%llu", sourceHandleId, flight.recording);
+    NrFlightTrace::Write("NR_RECORD", commandList, label);
 }
+
+struct NrRetirementObservation
+{
+    bool enabled = false, admitted = false, waited = false, pending = false;
+    unsigned int handle;
+    unsigned long long started = 0;
+    explicit NrRetirementObservation(unsigned int source) : handle(source)
+    {
+        const auto* cfg = Config::Instance();
+        enabled = cfg->LogToFile.value_or_default() || cfg->LogToConsole.value_or_default() ||
+                  cfg->LogToNGX.value_or_default();
+        if (enabled) started = GetTickCount64();
+    }
+    ~NrRetirementObservation()
+    {
+        if (!enabled) return;
+        // Evaluate owns g_nrMutex. At most one summary per second per handle;
+        // no per-frame disk trace, and no timing/counter work with logging off.
+        struct Window { unsigned long long started = 0; DlssNr::NrRetirementCadence stats; };
+        static std::unordered_map<unsigned int, Window> windows;
+        auto& window = windows[handle];
+        if (window.started == 0) window.started = started;
+        const auto now = GetTickCount64();
+        window.stats.Observe(now - started, admitted, waited, pending);
+        if (now - window.started < 1000) return;
+        LOG_INFO("V23227 NR cadence handle {} calls {} waits {} skips {} pending {} cpu_total_ms {} cpu_max_ms {} scope=feature",
+                 handle, window.stats.calls, window.stats.waits, window.stats.skipped,
+                 window.stats.pending, window.stats.totalMs, window.stats.maximumMs);
+        window.stats = {};
+        window.started = now;
+    }
+};
 
 bool RetirePreviousNrEvaluate(unsigned int sourceHandleId)
 {
+    NrRetirementObservation observation(sourceHandleId);
     Microsoft::WRL::ComPtr<ID3D12Fence> fence;
     unsigned long long fenceValue = 0;
 
@@ -327,10 +387,11 @@ bool RetirePreviousNrEvaluate(unsigned int sourceHandleId)
         std::lock_guard<std::mutex> lock(g_nrFlightMutex);
         const auto found = g_nrFlights.find(sourceHandleId);
         if (found == g_nrFlights.end())
-            return true;
+            return observation.admitted = true;
 
         if (found->second.awaitingSubmission)
         {
+            observation.pending = true;
             const auto skipped = ++g_nrRetirementSkips;
             if (skipped == 1 || (skipped % 120) == 0)
                 LOG_WARN("V23216 DLSS-NR skipped handle {}: its previous command list has not been submitted yet (skip {})",
@@ -342,12 +403,20 @@ bool RetirePreviousNrEvaluate(unsigned int sourceHandleId)
         fenceValue = found->second.fenceValue;
     }
 
-    if (fence == nullptr || fenceValue == 0 || fence->GetCompletedValue() >= fenceValue)
-        return true;
+    const auto completed = fence == nullptr ? 0 : fence->GetCompletedValue();
+    wchar_t retirementLabel[200] {};
+    swprintf_s(retirementLabel, L"NR_REUSE handle=%u fence=%p required=%llu completed=%llu",
+               sourceHandleId, fence.Get(), fenceValue, completed);
+    NrFlightTrace::Write("NR_REUSE", nullptr, retirementLabel);
+    if (completed == UINT64_MAX)
+        return false;
+    if (fence == nullptr || fenceValue == 0 || DlssNr::NrFenceRetired(completed, fenceValue))
+        return observation.admitted = true;
 
     // Same-eye evaluates are normally about two game frames apart, so the fence is already complete.
     // Give a temporarily deep queue a small chance to drain; if it does not, skip this NR evaluate
     // instead of either stalling the render thread or reusing in-flight NVIDIA state.
+    observation.waited = true;
     HANDLE eventHandle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (eventHandle != nullptr)
     {
@@ -356,8 +425,8 @@ bool RetirePreviousNrEvaluate(unsigned int sourceHandleId)
         {
             const DWORD waitResult = WaitForSingleObject(eventHandle, 8);
             CloseHandle(eventHandle);
-            if (waitResult == WAIT_OBJECT_0)
-                return true;
+            if (waitResult == WAIT_OBJECT_0 && DlssNr::NrFenceRetired(fence->GetCompletedValue(), fenceValue))
+                return observation.admitted = true;
         }
         else
         {
@@ -995,28 +1064,33 @@ void ReportSkipOnce(const char* reason)
         LOG_INFO("DLSS-NR did not run: {}", reason);
 }
 
-void NotifyCommandListsSubmitted(ID3D12CommandQueue* queue, unsigned int commandListCount,
-                                 ID3D12CommandList* const* commandLists)
+std::vector<NrSubmissionReceipt> TakeCommandListSubmissionReceipts(
+    unsigned int commandListCount, ID3D12CommandList* const* commandLists)
 {
-    if (queue == nullptr || commandLists == nullptr || commandListCount == 0)
-        return;
-
+    std::vector<NrSubmissionReceipt> receipts;
+    if (commandLists == nullptr)
+        return receipts;
     std::lock_guard<std::mutex> lock(g_nrFlightMutex);
-    std::unordered_set<unsigned int> submittedHandles;
-
     for (unsigned int i = 0; i < commandListCount; ++i)
     {
-        auto* graphicsList = static_cast<ID3D12GraphicsCommandList*>(commandLists[i]);
-        const auto recorded = g_nrRecordedLists.find(graphicsList);
-        if (recorded == g_nrRecordedLists.end())
-            continue;
-
-        submittedHandles.insert(recorded->second.begin(), recorded->second.end());
-        g_nrRecordedLists.erase(recorded);
+        auto detached = g_nrSubmissionLedger.Detach(commandLists[i]);
+        receipts.insert(receipts.end(), detached.begin(), detached.end());
     }
+    for (const auto& receipt : receipts)
+    {
+        wchar_t label[160] {};
+        swprintf_s(label, L"NR_DETACH handle=%u recording=%llu", receipt.handle, receipt.recording);
+        NrFlightTrace::Write("NR_DETACH", static_cast<ID3D12GraphicsCommandList*>(receipt.list), label);
+    }
+    return receipts;
+}
 
-    if (submittedHandles.empty())
+void CompleteCommandListSubmission(ID3D12CommandQueue* queue,
+                                   const std::vector<NrSubmissionReceipt>& receipts)
+{
+    if (queue == nullptr || receipts.empty())
         return;
+    std::lock_guard<std::mutex> lock(g_nrFlightMutex);
 
     NrQueueFence& queueFence = g_nrQueueFences[queue];
     if (queueFence.fence == nullptr)
@@ -1044,16 +1118,22 @@ void NotifyCommandListsSubmitted(ID3D12CommandQueue* queue, unsigned int command
         return;
     }
 
-    for (const unsigned int handleId : submittedHandles)
+    for (const auto& receipt : receipts)
     {
-        const auto found = g_nrFlights.find(handleId);
-        if (found == g_nrFlights.end())
+        const auto found = g_nrFlights.find(receipt.handle);
+        if (found == g_nrFlights.end() || found->second.recording != receipt.recording ||
+            !g_nrSubmissionLedger.Complete(receipt))
             continue;
 
         found->second.awaitingSubmission = false;
         found->second.recordedList = nullptr;
         found->second.fence = queueFence.fence;
         found->second.fenceValue = fenceValue;
+        wchar_t label[220] {};
+        swprintf_s(label, L"NR_SUBMIT handle=%u recording=%llu queue=%p fence=%p value=%llu completed=%llu",
+                   receipt.handle, receipt.recording, queue, queueFence.fence.Get(), fenceValue,
+                   queueFence.fence->GetCompletedValue());
+        NrFlightTrace::Write("NR_SUBMIT", static_cast<ID3D12GraphicsCommandList*>(receipt.list), label);
     }
 }
 
@@ -1076,6 +1156,10 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
         return;
     }
 
+    NrPerHandle& nr = g_nrByHandle[sourceHandleId];
+    // Read the game's reset before validation, retirement or NR parameter writes.
+    // Missing resources / unsubmitted work must not lose a one-frame reset pulse.
+    CaptureSourceHistoryReset(nr, sourceHandleId, params);
     ID3D12Resource* target = GetResource(params, NVSDK_NGX_Parameter_Color, "DLSSD.Color");
     ID3D12Resource* srOutput = GetResource(params, NVSDK_NGX_Parameter_Output, "DLSSD.Output");
     ID3D12Resource* depth = GetResource(params, NVSDK_NGX_Parameter_Depth, "DLSSD.Depth");
@@ -1101,8 +1185,6 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
 
     // The source handle is the temporal identity. Witcher VR evaluates two same-sized DLSS features
     // in strict left/right alternation; keying only on dimensions made both eyes share one NR history.
-    NrPerHandle& nr = g_nrByHandle[sourceHandleId];
-
     if (g_nrRetirementSignalFailed.load(std::memory_order_acquire))
     {
         g_runtime.failed = true;
@@ -1541,6 +1623,11 @@ void EvaluateBeforeUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandLis
 
     int result = 0;
     {
+        wchar_t modelReceipt[256] {};
+        swprintf_s(modelReceipt, L"NR_MODEL handle=%u feature=%p params=%p color=%p depth=%p motion=%p output=%p reset=%u source=%u",
+                   sourceHandleId, nr.feature, evaluateParams, modelInput, depthIn, motionIn, nr.output,
+                   nr.reset ? 1u : 0u, nr.sourceReset ? 1u : 0u);
+        NrFlightTrace::Write("NR_MODEL", cmdList, modelReceipt);
         DredScope stage(cmdList, L"OptiScaler V23216 DLSS-NR pre-SR model");
         result = g_runtime.evaluate(
             cmdList, nr.feature, evaluateParams, modelInput, depthIn, motionIn, nr.output,
@@ -1723,6 +1810,8 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
         return;
     }
 
+    NrPerHandle& nr = g_nrByHandle[sourceHandleId];
+    CaptureSourceHistoryReset(nr, sourceHandleId, params);
     ID3D12Resource* target = GetResource(params, NVSDK_NGX_Parameter_Output, "DLSSD.Output");
     ID3D12Resource* depth = GetResource(params, NVSDK_NGX_Parameter_Depth, "DLSSD.Depth");
     ID3D12Resource* motion = GetResource(params, NVSDK_NGX_Parameter_MotionVectors, "DLSSD.MotionVectors");
@@ -1747,8 +1836,6 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
 
     // The source handle is the temporal identity. Witcher VR evaluates two same-sized DLSS features
     // in strict left/right alternation; keying only on dimensions made both eyes share one NR history.
-    NrPerHandle& nr = g_nrByHandle[sourceHandleId];
-
     if (g_nrRetirementSignalFailed.load(std::memory_order_acquire))
     {
         g_runtime.failed = true;
@@ -2160,6 +2247,11 @@ void EvaluateAfterUpscale(unsigned int sourceHandleId, ID3D12GraphicsCommandList
 
     int result = 0;
     {
+        wchar_t modelReceipt[256] {};
+        swprintf_s(modelReceipt, L"NR_MODEL handle=%u feature=%p params=%p color=%p depth=%p motion=%p output=%p reset=%u source=%u",
+                   sourceHandleId, nr.feature, evaluateParams, modelInput, depthIn, motionIn, nr.output,
+                   nr.reset ? 1u : 0u, nr.sourceReset ? 1u : 0u);
+        NrFlightTrace::Write("NR_MODEL", cmdList, modelReceipt);
         DredScope stage(cmdList, L"OptiScaler V23216 DLSS-NR post-SR model");
         result = g_runtime.evaluate(
             cmdList, nr.feature, evaluateParams, modelInput, depthIn, motionIn, nr.output,
@@ -2387,7 +2479,7 @@ void Shutdown()
 
     {
         std::lock_guard<std::mutex> flightLock(g_nrFlightMutex);
-        g_nrRecordedLists.clear();
+        g_nrSubmissionLedger.Clear();
         g_nrFlights.clear();
         g_nrQueueFences.clear();
     }
