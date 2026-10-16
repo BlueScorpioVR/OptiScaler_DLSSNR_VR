@@ -5,6 +5,7 @@
 #include "DlssNr.h"
 #include "NrBeforeSrContract.h"
 #include "NrRetirementCadence.h"
+#include "NrRetirementWait.h"
 #include "NrHistoryContract.h"
 #include "NrGuideSnapshot.h"
 
@@ -419,31 +420,24 @@ bool RetirePreviousNrEvaluate(unsigned int sourceHandleId)
     if (fence == nullptr || fenceValue == 0 || DlssNr::NrFenceRetired(completed, fenceValue))
         return observation.admitted = true;
 
-    // Same-eye evaluates are normally about two game frames apart, so the fence is already complete.
-    // Give a temporarily deep queue a small chance to drain; if it does not, skip this NR evaluate
-    // instead of either stalling the render thread or reusing in-flight NVIDIA state.
+    // A frame-budget timeout produces a raw frame between NR frames (visible flicker).
+    // Wait for this feature's submitted work instead. Never wait for an unsubmitted
+    // list above: the calling thread may itself be responsible for submitting it.
+    // Polling avoids closing an event while its fence registration is still pending.
     observation.waited = true;
-    HANDLE eventHandle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (eventHandle != nullptr)
-    {
-        const HRESULT setResult = fence->SetEventOnCompletion(fenceValue, eventHandle);
-        if (SUCCEEDED(setResult))
-        {
-            const DWORD waitResult = WaitForSingleObject(eventHandle, 8);
-            CloseHandle(eventHandle);
-            if (waitResult == WAIT_OBJECT_0 && DlssNr::NrFenceRetired(fence->GetCompletedValue(), fenceValue))
-                return observation.admitted = true;
-        }
-        else
-        {
-            CloseHandle(eventHandle);
-        }
-    }
+    const auto result = DlssNr::WaitForNrRetirement(fenceValue,
+        [&] { return fence->GetCompletedValue(); },
+        [] { return GetTickCount64(); }, [] { Sleep(1); });
+    if (result == DlssNr::NrRetirementResult::Retired)
+        return observation.admitted = true;
 
-    const auto skipped = ++g_nrRetirementSkips;
-    if (skipped == 1 || (skipped % 120) == 0)
-        LOG_WARN("V23216 DLSS-NR skipped handle {}: previous GPU evaluate has not retired (skip {})",
-                 sourceHandleId, skipped);
+    // Latch failure rather than oscillating between NR and raw frames after a
+    // watchdog timeout. Existing evaluate-entry guards disable NR until restart.
+    g_nrRetirementSignalFailed.store(true, std::memory_order_release);
+    LOG_ERROR("DLSS-NR disabled until restart: handle {} retirement {} (fence {})",
+              sourceHandleId,
+              result == DlssNr::NrRetirementResult::DeviceLost ? "device lost" : "watchdog expired",
+              fenceValue);
     return false;
 }
 
