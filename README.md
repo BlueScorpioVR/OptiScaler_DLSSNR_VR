@@ -38,7 +38,24 @@ General-game support remains experimental, not a universal installer.
 
 This revision retains V23238 rendering and NR lifetime safeguards; V23239-V23243
 readiness experiments are excluded. NR/DRED recording, image captures and the
-post-HUD file follow logging switches. Required GPU retirement remains active.
+post-HUD file follow logging switches.
+
+### DLSS Neural Rendering flicker fix (BlueScorpioVR)
+
+The BlueScorpioVR build fixes intermittent NR texture flicker caused when an
+evaluation was skipped because the previous evaluation for that eye had not
+retired within an 8 ms timeout. Skipping alternated NR-processed and untouched
+frames. The build now waits for the exact submitted per-eye GPU work to retire
+before reusing that eye's NR feature, parameters and scratch resources. It keeps
+the submission-receipt checks and does not wait on command lists that have not
+yet been submitted.
+
+This is a mitigation for the observed flicker, not a confirmed explanation of
+the vendor NR backend's root cause. Waiting can cause a render-thread hitch if
+the GPU queue is backed up. A two-second watchdog disables NR until restart if
+retirement stalls or the device is lost. The fix is covered by retirement-wait
+tests, but performance and stability should still be verified in the target
+game and headset.
 
 Use the tested [Witcher 3 VR v0.9.8 package](https://github.com/tig3rmast3r/witcher3-vr/releases/tag/v0.9.8).
 The NVIDIA NR DLL is not redistributed. The separate general-game development
